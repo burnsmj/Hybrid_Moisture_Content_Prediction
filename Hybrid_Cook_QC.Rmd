@@ -1,0 +1,146 @@
+---
+title: "Hybrid Cook Progress"
+author: "Michael Burns"
+date: "7/6/2022"
+output: html_document
+---
+
+
+```{r libraries}
+library(tidyverse)
+library(magrittr)
+library(car)
+```
+
+```{r load_data}
+cook_data = read_csv('ML_Hybrid_Validation.csv') %>%
+  mutate(ID = paste(Sample_ID, Hotplate.ID, Hotplate.Pos, sep = '_'), .before = Cook.Date)
+labels = read_csv('~/Downloads/Hybrids_For_ML_Validation - Cook Packing Labels.csv') %>%
+  mutate(ID = paste(Label, Hotplate, Hotplate.Pos, sep = '_'))
+```
+
+```{r look at data}
+head(cook_data)
+dim(cook_data)
+head(labels)
+dim(labels)
+```
+
+```{r number of reps}
+cook_data %>%
+  group_by(Sample_ID) %>%
+  summarise(count = n()) %>%
+  filter(count != 2)
+```
+
+```{r determine which samples haven't been cooked}
+labels %>%
+  filter(!ID %in% cook_data$ID) %>%
+  group_by(Label) %>%
+  summarise(count = n())
+```
+
+```{r distribution of moisture content}
+cook_data %>%
+  ggplot(aes(x = Moisture.Avg))+
+  geom_histogram(bins = 10)+
+  theme_classic()
+
+cook_data %>%
+  group_by(Sample_ID) %>%
+  summarise(mean_mc = mean(Moisture.Avg)) %>%
+  ggplot(aes(x = mean_mc))+
+  geom_histogram(bins = 10)+
+  theme_classic()
+```
+The plot is roughly normally distributed with a secondary peak showing on the lower end.
+
+```{r QC Reps}
+# Moisture Subsample Reps
+cor(cook_data$Y.Kernel.Moisture, cook_data$Z.Kernel.Moisture)
+plot(cook_data$Y.Kernel.Moisture, cook_data$Z.Kernel.Moisture)
+
+# Cook Reps
+cook_data %>%
+  pivot_wider(id_cols = Sample_ID, values_from = Moisture.Avg, names_from = Hotplate.ID) %>%
+  unnest(A) %>%
+  unnest(B) %$%
+  cor(A, B, use = 'complete.obs')
+
+cook_data %>%
+  pivot_wider(id_cols = Sample_ID, values_from = Moisture.Avg, names_from = Hotplate.ID) %>%
+  unnest(A) %>%
+  unnest(B) %$%
+  plot(A, B)
+```
+There isn't as much correlation between reps that I would have expected.  Lets run an anova to see what has the largest effect (cook, cook time, steep time, pH, genotype, etc).  What is causing the difference in correlations?  Are the two hotplates just different?  Does it have anything to do with the one hotplate dying?
+
+I started heating up both hotplates and monitored temperature with an external thermometer.  I found that hotplate A was actually self-sensing a couple degrees (2-3C) hotter than the thermometer said, while hotplate B was self-sensing well below what the thermometer said (10-15C).  This doesn't really explain the difference I see between actual cook and prediction where the prediction seems higher than the cook, but it could potentially play a role.
+
+How do the Y and Z samples within both A and B correlate to each other?  I would expect these to both be relatively high and similar since they come from the same sample.
+```{r correlation of Y and Z within A and B}
+cor(cook_data$Y.Kernel.Moisture[cook_data$Hotplate.ID == 'A'], cook_data$Z.Kernel.Moisture[cook_data$Hotplate.ID == 'A'])
+plot(cook_data$Y.Kernel.Moisture[cook_data$Hotplate.ID == 'A'], cook_data$Z.Kernel.Moisture[cook_data$Hotplate.ID == 'A'])
+
+cor(cook_data$Y.Kernel.Moisture[cook_data$Hotplate.ID == 'B'], cook_data$Z.Kernel.Moisture[cook_data$Hotplate.ID == 'B'])
+plot(cook_data$Y.Kernel.Moisture[cook_data$Hotplate.ID == 'B'], cook_data$Z.Kernel.Moisture[cook_data$Hotplate.ID == 'B'])
+```
+
+What about if we look at the correlation between A and B before and after the hotplate was changed?  We will likely have small sample sizes for this as the A/B combinations could have been completed on either side of that date (1/11/22).  We should look at the combinations completed before, across, and after to see if correlation dips.
+```{r}
+cook_data %>%
+  pivot_wider(id_cols = Sample_ID, names_from = Hotplate.ID, values_from = Moisture.Avg) %>%
+  unnest(A) %>%
+  unnest(B) %>%
+  summarise(Cor_AB = cor(A, B, use = 'complete.obs'),
+            N_AB = n() - sum(is.na(B)))
+```
+
+The correlations are only mediocre for hotplate A to both B and C.  It is possible that hotplate B was also off on temp or something similar.
+
+Lets plot out the correlations between A and B and then A and C to see if they are actually cooking differently than a 1:1.
+```{r}
+cook_data %>%
+  pivot_wider(id_cols = Sample_ID, names_from = Hotplate.ID, values_from = Moisture.Avg) %>%
+  unnest(A) %>%
+  unnest(B) %>%
+  ggplot(aes(A, B))+
+  geom_point()+
+  geom_abline()+
+  ylim(0.38, 0.5)+
+  xlim(0.38, 0.5)+
+  theme_classic()
+```
+
+This is most likely just showing cook to cook variation.  We would need to look at something cooked on the same hotplate multiple times.  It does make me wonder what the correlation is for samples that have both reps cooked on the same day.
+```{r}
+cook_data %>%
+  pivot_wider(id_cols = c(Sample_ID), names_from = Hotplate.ID, values_from = Cook.Date) %>%
+  filter(A == B | A == C)
+```
+
+
+These correlation plots just show that the two hotplates aren't well correlated, but if temperature differences existed at the extend of 15C, I would expect very different levels of moisture content, and for the datapoints to not be surrounding the 1:1 line.
+
+```{r PVE model}
+# Determine cook time and steep time
+cook_data_timed = cook_data %>%
+  mutate(Cook_Length = as.numeric(difftime(strptime(cook_data$Bath.Start, format = '%H:%M'), 
+                                strptime(Cook.Time, format = '%H:%M'))), 
+         Steep_Length = as.numeric(difftime(strptime(cook_data$Bath.End, format = '%H:%M'), 
+                                strptime(Bath.Start, format = '%H:%M')) + 12),
+         .before = Cook.Time) %>%
+  filter(!is.na(Cook_Length),
+         !is.na(Steep_Length))
+
+model = lm(Moisture.Avg ~ factor(Sample_ID) + factor(Hotplate.ID) + factor(Hotplate.Pos) + pH + Cook_Length + Steep_Length + factor(Cook), data = cook_data_timed)
+
+Anova(model, type = 2) %>%
+  as_tibble() %>%
+  mutate(Factors = c('Sample_ID', 'Hotplate.ID', 'Hotplate.Pos', 'pH',
+                     'Cook_Length', 'Steep_Length', 'Cook', 'Residual')) %>%
+  mutate(tot_SS = sum(`Sum Sq`),
+         PVE = `Sum Sq` / tot_SS)
+# remember to remove samples without cook length
+```
+Sample ID contributes the bulk of the PVE, which is good to see.  We are minimizing the variation of the other components and still seeing variation in moisture content due to the genetic background.

@@ -1,0 +1,523 @@
+---
+title: "Hybrid Scan Data EDA"
+author: "Michael Burns"
+date: "6/30/2022"
+output: html_document
+---
+
+The moisture content prediction model did not perform very well on hybrids (R = 0.12), and based on some analysis using PCA and plotting spectra (PLS_POC.R) it looks like it is not due to compositional or spectral differences.  We are assuming the difference is due to anatomical, morphological, or distribution of compositional components.  
+
+This more or less means we need to re-make the model for a hybrid model.  Before doing that, we need to do some EDA to understand the data, clean it, and choose which samples we will use to train it.
+
+```{r libraries}
+library(tidyverse)
+library(magrittr)
+library(car)
+library(prospectr)
+```
+
+```{r data}
+data <- read_csv("~/Desktop/Grad_School/Research/Projects/Machine_Learning/Hybrid_Validation/Hybrid_Rescans.csv") %>%
+  select(1:142) %>%
+  mutate(row = row_number()) %>%
+  arrange(desc(row)) %>%
+  distinct(Sample_ID, .keep_all = T) %>%
+  arrange(row) %>%
+  select(-row)
+```
+
+Look at the summary of the data
+```{r view data}
+head(data)
+dim(data)
+str(data)
+summary(data)
+```
+
+Plot the number of outliers per waveband.
+```{r look for outliers by waveband}
+data %>%
+  mutate(Rep = str_extract(Sample_ID, '_[1-2]$'),
+         Rep = as.double(str_remove(Rep, '_')),
+         Sample_ID = str_remove(Sample_ID, '_[1-2]$')) %>%
+  pivot_longer(cols = -c(Sample_ID, Rep), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  group_by(Waveband) %>%
+  mutate(q1 = quantile(Absorbance, 0.25),
+         q3 = quantile(Absorbance, 0.75),
+         iqr = q3 - q1,
+         lower_thresh = q1 - (1.5*iqr),
+         upper_thresh = q3 + (1.5*iqr),
+         outlier = case_when(Absorbance > upper_thresh | Absorbance < lower_thresh ~ 'Y',
+                             Absorbance < upper_thresh & Absorbance > lower_thresh ~ 'N')) %>%
+  summarise(num_outliers = sum(outlier == 'Y'),
+            n_total = n()) %>%
+  ggplot(aes(x = Waveband, y = num_outliers))+
+  geom_point()+
+  theme_classic()
+```
+Given that wavebands are so intercorrelated, some of the peaks may be caused by nearby wavebands being inter correlated.  I will run the Mahalanobis distance code from the inbred model paper to remove outliers that way.
+
+```{r m-dist outlier removal}
+#Create a matrix with lower and upper limits equal to the min and max wavelengths in your dataset
+#Select every 10th (you could also do every 5th, 3rd, etc.)wavelength to remove collinearity issues for outlier detection
+wavebands <- seq(950, 1650, 10)
+
+#Calculate the mahalanobis distance on all samples using subset of wavelengths
+m_dist <- as.matrix(mahalanobis(data[,colnames(data) %in% wavebands], 
+                                colMeans(data[,colnames(data) %in% wavebands]), 
+                                cov(data[,colnames(data) %in% wavebands]),na.rm=TRUE))
+
+data$Mdist = round(m_dist, 1)
+
+#Calculate  threshold for sample to be considered an outlier (here I use 3 times the mean)
+data_clean = data %>%
+  mutate(MThresh = 3 * mean(Mdist)) %>%
+  filter(Mdist < MThresh) %>% # removed 11 samples
+  mutate(Rep = str_remove(str_extract(Sample_ID, '_[1-2]$'), '_'), .before = `950`,
+         Sample_ID = str_remove(Sample_ID, '_[1-2]$')) %>%
+  select(-Mdist,
+         -MThresh)
+  
+```
+
+Check correlation between replicates
+```{r correlation between replicates}
+data_clean %>%
+  pivot_longer(cols = -c(1:6), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  pivot_wider(id_cols = c(Sample_ID, Waveband), names_from = Rep, values_from = Absorbance) %>%
+  unnest(c('1','2')) %>%
+  group_by(Sample_ID) %>%
+  filter(!is.na(`1`),
+         !is.na(`2`)) %>% # Some samples don't have two replicates due to the removal of outliers
+  summarise(Corr = cor(`1`, `2`, use = 'complete.obs')) %>%
+  ggplot(aes(x = Corr))+
+  geom_histogram()+
+  xlim(0,1.05)+
+  theme_classic()
+```
+The correlation between replicates is very high, we shouldn't need to worry about anything related to scanning uniformity issues.
+
+Lets average the replicates to reduce the potential error moving forward
+```{r average hybrid replicates}
+avgd_data = data_clean %>%
+  filter(`950` != max(`950`)) %>%
+  group_by(Sample_ID) %>%
+  mutate(count = n()) %>%
+  filter(count == 2) %>%
+  select(-count) %>%
+  pivot_longer(cols = -c(Sample_ID, Rep), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  group_by(Sample_ID, Waveband) %>%
+  summarise(Mean_Absorbance = mean(Absorbance)) %>%
+  pivot_wider(id_cols = Sample_ID, names_from = Waveband, values_from = Mean_Absorbance) %>%
+  select(Sample_ID, as.character(seq(950,1650,5))) %>%
+  ungroup()
+```
+
+
+```{r look at the pca spread of the data}
+hybrid_pca = prcomp(avgd_data[,2:142], scale. = T, center = T)
+
+#summary(hybrid_pca)
+
+avgd_data %>%
+  select(1) %>%
+  bind_cols(as_tibble(hybrid_pca$x)) %>%
+  ggplot(aes(x = PC1, y = PC2))+
+  geom_point()+
+  labs(title = 'PCA of Hybrid Scans')+
+  theme_classic()
+
+avgd_data %>%
+  pivot_longer(cols = -c(Sample_ID), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, group = Sample_ID))+
+  geom_line()+
+  theme_classic()
+```
+It looks like the data clusters very nicely except for 1 point that has a pc2 greater than 8. 
+
+Do the hybrid scans overlap with the inbred scans?
+```{r inbred and hybrid scan pca overlap}
+inbreds = read_csv('../Data/Master_Training_Spectra_No_Outliers.csv')
+
+inbreds_pca_pred = predict(hybrid_pca, inbreds[,4:144])
+
+avgd_data %>%
+  select(1) %>%
+  bind_cols(as_tibble(hybrid_pca$x)) %>%
+  select(1:3) %>%
+  mutate(Genetics = 'Hybrid') %>%
+  bind_rows(inbreds %>%
+              select(1) %>%
+              bind_cols(as_tibble(inbreds_pca_pred)) %>%
+              select(1:3) %>%
+              mutate(Genetics = 'Inbred')) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Genetics))+
+  geom_point()+
+  scale_color_manual(values = c('darkblue', 'darkred'), breaks = c('Inbred', 'Hybrid'))+
+  labs(title = 'PCA of Hybrid Scans')+
+  theme_classic()
+```
+The inbreds seem to be more diverse (as is expected), though a little lower for PC1, and more spread out (which could also be due to the N value, as the inbreds have about 316 points, and the hybrids have over 1000).
+
+```{r anova model for each waveband}
+pves = tibble()
+
+for(wvbd in 3:143){
+  print(colnames(data_clean[wvbd]))
+  wvbd_model = lm(data_clean[[wvbd]] ~ Sample_ID + Rep, data = data_clean)
+  
+  anova_table = as_tibble(Anova(wvbd_model, type = 2)) %>%
+  mutate(Feature = c('Sample_ID', 'Rep', 'Residuals'), .before = `Sum Sq`) %>%
+  mutate(total_SS = sum(`Sum Sq`),
+         PVE = `Sum Sq` / total_SS) 
+  
+  pves = anova_table %>%
+    select(Feature, PVE) %>%
+    mutate(wvbd = as.numeric(colnames(data_clean[wvbd]))) %>%
+    bind_rows(pves)
+}
+
+pves %>%
+  ggplot(aes(x = wvbd, y = PVE))+
+  geom_bar(stat = 'identity')+
+  theme_classic()+
+  facet_wrap(~Feature)
+```
+Some of the residuals (and likely some of the Sample_ID) belongs to environment, but it is too difficult to parse out with this dataset.  Regardless, SampleID explains the vast majority of NIR absorbances, and thus composition.
+
+We have a number of samples already cooked, so we can use these as training samples, but we will still need around 150 more.  To find a good variety of samples I will use the hybid scan PCA, remove the samples we already have, and use a calibration selection method (with k = 200-n_cooked_already) to find diverse samples.
+
+The next few sections of code that is commented out was used to to select samples for training before we had the rescanned data back.  These are likely not ideal, but we will try to maximize their use.  We can either remove them from the PCA dataset and select the remaining amount we need, or we can keep them in, select the number that we need total, and try to use whatever has been cooked that isn't in the training set as the test set.  I think the best method will be the latter option as it will more fully capture the diversity of samples that we have.  I can still look at where the cooked samples fall in this pca to see if they are spaced out enough.  It is also worth considering that the replicates between scanning and cooking are not the same, so it probably makes sense to average the scans for a given scan replicate.
+
+```{r finding samples for cooking}
+#list_of_train = ksp_grouping %>%
+#  filter(Group == 'Train') %>%
+#  select(Sample_ID) %>%
+#  pull()
+
+#set.seed(7)
+#data_clean %>%
+#  ungroup() %>%
+#  mutate(Tray_Size = case_when(str_detect(Tray, 'Large') ~ 'L',
+#                               str_detect(Tray, 'Small') ~ 'S')) %>%
+#  group_by(Sample_ID) %>%
+#  mutate(N_Trays = n_distinct(Tray_Size)) %>%
+#  filter(N_Trays == 1,
+#         Tray == 'Small Tray, rotating',
+#         Sample_ID %in% list_of_train) %>%
+#  select(Sample_ID) %>%
+#  unique() %>%
+#  write_csv('small_tray_hybrids_for_training.csv')
+```
+
+Most of the samples generated above have been cooked and now new samples are needed without having all of the scan data, so I am going to find samples from the Pioneer Agronomic set (since this is what was chosen in the last batch).  I noticed that a lot of samples came from specific categories.  I would like to make sure the training set includes individuals from different environments and planting densities.  To know what is needed I need to first figure out what we currently have.
+
+```{r determining groupings of PA samples already used}
+#first_pa_samples = read_csv('small_tray_hybrids_for_training.csv') %>%
+#  separate(Sample_ID, into = c('Experiment', 'Barcode'), '_')
+#pa_sample_xref = readxl::read_xlsx('~/Downloads/Pioneer samples_UMN_pop study.xlsx')
+
+#cooked_pa_samples = pa_sample_xref %>%
+#  filter(Barcode %in% first_pa_samples$Barcode)
+
+#cooked_pa_samples %>%
+#  group_by(Location) %>%
+#  summarise(count = n())
+
+#cooked_pa_samples %>%
+#  group_by(Population) %>%
+#  summarise(count = n())
+
+#cooked_pa_samples %>%
+#  group_by(GE) %>%
+#  summarise(count = n())
+
+#pa_sample_xref %>%
+#  filter(!Barcode %in% first_pa_samples$Barcode,
+#         Population == '28000' | Population == '34000',
+#         Location == 'MOBNPOB2' | Location == 'YABN66H2')
+```
+
+Based on these values, it looks like to round out the sampling we will need the following from locations:
+CI = 4
+MO = 9
+MR = 1
+UC = 7
+YA = 9
+And the following from populations:
+28 = 13
+34 = 9
+40 = 3
+46 = 5
+And the following for Genotypes
+P0760AMXT	= 5		
+P0928	= 2
+P1105AM	= 5		
+P1345YHR = 4			
+P1443YHR = 4		
+P1498AM	= 2			
+P1555CHR = 4			
+P1602AM = 4
+
+```{r}
+#xref_samples_weighted = pa_sample_xref %>%
+#  filter(!Barcode %in% first_pa_samples$Barcode) %>%
+#  mutate(Location_Wgt = case_when(str_detect(Location, '^CI') ~ 4 / 30,
+#                                  str_detect(Location, '^MO') ~ 9 / 30,
+#                                  str_detect(Location, '^MR') ~ 1 / 30,
+#                                  str_detect(Location, '^UC') ~ 7 / 30,
+#                                  str_detect(Location, '^YA') ~ 9 / 30),
+#         Population_Wgt = case_when(Population == 28000 ~ 13 / 30,
+#                                    Population == 34000 ~ 9 / 30,
+#                                    Population == 40000 ~ 3 / 30,
+#                                    Population == 46000 ~ 5 / 30),
+#         Genotype_Wgt = case_when(GE == 'P0760AMXT' ~ 5 / 30,
+#                                  GE == 'P0928' ~ 2 / 30,
+#                                  GE == 'P1105AM' ~ 5 / 30,
+#                                  GE == 'P1345YHR' ~ 4 / 30,
+#                                  GE == 'P1443YHR' ~ 4 / 30,
+#                                  GE == 'P1498AM' ~ 2 / 30,
+#                                  GE == 'P1555CHR' ~ 4 / 30,
+#                                  GE == 'P1602AM' ~ 4 / 30),
+#         Overall_Wgt = (Location_Wgt * Population_Wgt * Genotype_Wgt) / 2) # Divide by 2 for 2 reps
+
+#set.seed(7)
+#barcodes_round_2 = sample(xref_samples_weighted$Barcode, 30, prob = xref_samples_weighted$Overall_Wgt)
+
+#pa_sample_xref %>%
+#  filter(Barcode %in% barcodes_round_2) %>%
+#  group_by(Population) %>% # Change this to GE, Location, or Population to see the count data
+#  summarise(count = n())
+
+#pa_sample_xref %>%
+#  filter(Barcode %in% barcodes_round_2) %>%
+#  select(Barcode) %>%
+#  mutate(Barcode = paste0('PA_', Barcode)) %>%
+#  write_csv('Hybrids_For_Training_Round_2.csv')
+```
+
+Samples were chosen based on a weighted random sampling.  It is not perfect, but it gets all of the different types of samples closer to even and gives better representation for each of the subclasses (genotype, population density, location) of the data.
+
+Now that we have new scan data for the hybrids, lets go through and process the data and determine how well the model is predicting.
+
+```{r averaging and writing out scan data}
+#data_pca_clean %>% 
+#  mutate(Sample_ID = paste0(Sample_ID, '_', Rep)) %>%
+#  select(1, 3:143) %>%
+#  write_csv("~/Desktop/Grad_School/Research/Projects/Machine_Learning/Hybrid_Validation/Hybrid_Rescans_Clean.csv")
+
+#avgd_data %>%
+#  write_csv("~/Desktop/Grad_School/Research/Projects/Machine_Learning/Hybrid_Validation/Hybrid_Rescans_Clean_Averaged.csv")
+```
+
+create a list of cooked hybrids
+```{r list of cooked hybrids}
+cooked_samples = read_csv('ML_Hybrid_Validation.csv') %>%
+  select(Sample_ID) %>%
+  unique()
+```
+
+For the remaining samples, I am going to use honigs regression since it is consistent (since it is a math based algorithm), and appears to be the most evenly spread throughout the spectra (kenstone - pca isn't working with this dataset) while also selecting the most extreme examples.  
+```{r honigs}
+#?honigs()
+honigs_list = honigs(avgd_data[2:142], k = 120)
+
+honigs_grouping = avgd_data %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% honigs_list$model ~ 'Train',
+                           row_num %in% honigs_list$test ~ 'Test'),
+         .before = `950`)
+
+pca_honigs = prcomp(honigs_grouping[,4:144], center = T, scale. = T)
+
+# How many total samples will be cooked by the end?
+honigs_grouping %>%
+  filter(Group == 'Train') %>%
+  select(Sample_ID) %>%
+  bind_rows(cooked_samples) %>%
+  unique() %>%
+  nrow()
+
+honigs_grouping %>%
+  select(1:4) %>%
+  bind_cols(as_tibble(pca_honigs$x)) %>%
+  mutate(Group = case_when(Group == 'Train' ~ 'Train',
+                               Group == 'Test' & Sample_ID %in% cooked_samples$Sample_ID ~ 'Train',
+                               Group == 'Test' & !Sample_ID %in% cooked_samples$Sample_ID ~ 'Test')) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group))+
+  geom_point()+
+  scale_color_manual(values = c('black', 'gray'), breaks = c('Train', 'Test'))+
+  theme_classic()
+
+honigs_grouping %>%
+  mutate(Group = case_when(Group == 'Train' ~ 'Train',
+                               Group == 'Test' & Sample_ID %in% cooked_samples$Sample_ID ~ 'Train',
+                               Group == 'Test' & !Sample_ID %in% cooked_samples$Sample_ID ~ 'Test')) %>%
+  pivot_longer(cols = -(1:4), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num))+
+  geom_line()+
+  scale_color_manual(values = c('black', 'gray'), breaks = c('Train', 'Test'))+
+  theme_classic()
+#honigs_grouping %>%
+#  filter(Group == 'Train') %>%
+#  filter(!Sample_ID %in% cooked_samples$Sample_ID) %>%
+#  select(Sample_ID) %>%
+#  write_csv('Hybrids_For_Training_Round_3.csv')
+```
+
+First, honigs regression
+```{r honigs}
+#?honigs()
+honigs_list = honigs(avgd_data[2:142], k = 120)
+
+honigs_grouping = avgd_data %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% honigs_list$test ~ 'Test',
+                           row_num %in% honigs_list$model ~ 'Train',
+                           Sample_ID %in% cooked_samples$Sample_ID ~ 'Train'),
+         .before = `950`)
+
+pca_honigs = prcomp(honigs_grouping[,4:144], center = T, scale. = T)
+
+honigs_grouping %>%
+  select(1:4) %>%
+  bind_cols(as_tibble(pca_honigs$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group))+
+  geom_point()+
+  theme_classic()
+
+honigs_grouping %>%
+  pivot_longer(cols = -(1:4), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num))+
+  geom_line()+
+  theme_classic()
+
+honigs_grouping %>%
+  filter(Group == 'Train') %>%
+  select(Sample_ID) %>%
+  bind_rows(cooked_samples) %>%
+  unique() %>%
+  nrow()
+```
+
+```{r kennard-stone-mahal}
+#?kenStone()
+ksm_list = kenStone(avgd_data[2:142], k = 120)
+
+ksm_grouping = avgd_data %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% ksm_list$test ~ 'Test',
+                           row_num %in% ksm_list$model ~ 'Train',
+                           Sample_ID %in% cooked_samples$Sample_ID ~ 'Train'),
+         .before = `950`)
+
+pca_ksm = prcomp(ksm_grouping[,4:144], center = T, scale. = T)
+
+ksm_grouping %>%
+  select(1:4) %>%
+  bind_cols(as_tibble(pca_ksm$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group))+
+  geom_point()+
+  theme_classic()
+
+ksm_grouping %>%
+  pivot_longer(cols = -(1:4), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num))+
+  geom_line()+
+  theme_classic()
+
+ksm_grouping %>%
+  filter(Group == 'Train') %>%
+  select(Sample_ID) %>%
+  bind_rows(cooked_samples) %>%
+  unique() %>%
+  nrow()
+```
+
+```{r kennard-stone-pca}
+#?kenStone()
+# Not working: Error in U %*% sqrt(D) : non-conformable arguments
+ksp_list = kenStone(avgd_data[2:142], k = 120, pc = 0.99)
+
+ksp_grouping = avgd_data %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% ksp_list$model ~ 'Train',
+                           row_num %in% ksp_list$test ~ 'Test'),
+         .before = `950`)
+
+pca_ksp = prcomp(ksp_grouping[,4:144], center = T, scale. = T)
+
+ksp_grouping %>%
+  select(1:4) %>%
+  bind_cols(as_tibble(pca_ksp$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group))+
+  geom_point()+
+  theme_classic()
+
+ksp_grouping %>%
+  pivot_longer(cols = -(1:4), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num))+
+  geom_line()+
+  theme_classic()
+```
+
+```{r k-means-norm}
+#?naes()
+kmn_list = naes(avgd_data[2:142], k = 138)
+
+kmn_grouping = avgd_data %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% kmn_list$model ~ 'Train',
+                           row_num %in% kmn_list$test ~ 'Test'),
+         .before = `950`)
+
+pca_kmn = prcomp(kmn_grouping[,4:144], center = T, scale. = T)
+
+kmn_grouping %>%
+  select(1:4) %>%
+  bind_cols(as_tibble(pca_kmn$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group))+
+  geom_point()+
+  theme_classic()
+
+kmn_grouping %>%
+  pivot_longer(cols = -(1:4), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num))+
+  geom_line()+
+  theme_classic()
+```
+
+```{r k-means-pca}
+kmp_list = naes(avgd_data[2:142], k = 138, pc = 0.99)
+
+kmp_grouping = avgd_data %>%
+  mutate(row_num = row_number(),
+         Group = case_when(row_num %in% kmp_list$model ~ 'Train',
+                           row_num %in% kmp_list$test ~ 'Test'),
+         .before = `950`)
+
+pca_kmp = prcomp(kmp_grouping[,4:144], center = T, scale. = T)
+
+kmp_grouping %>%
+  select(1:4) %>%
+  bind_cols(as_tibble(pca_kmp$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group))+
+  geom_point()+
+  theme_classic()
+
+kmp_grouping %>%
+  pivot_longer(cols = -(1:4), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Group, group = row_num))+
+  geom_line()+
+  theme_classic()
+```
+
+Based on the plots above, I think I will go with the Kennard-Stone (PCA) method to make sure I get the more extreme samples and am evenly sampling from across the PC coordinate space.  It is also more consistent than k-means.
