@@ -1,0 +1,2887 @@
+---
+title: "Reworking the Moisture Prediction Model"
+author: "Michael Burns"
+date: "8/29/2022"
+output: html_document
+---
+
+The moisture content prediction model from Burns et al. 2021 does not very accurately predict the moisture content of hybrid seed.  This could be for a number of reasons from lack of dynamic range in hybrids to lack of sample size, to a difference in the morphology and compositional distribution of hybrids compared to inbreds that is not captured by the NIR scanning of ground samples. My primary suspicion is the last option, but to test the others I am going to include more preprocessing techniques from the prospectr package to try to improve the model to a more general and accurate state.
+
+# Libraries and Data Loading
+
+The first step is to load the libraries that will be needed
+```{r libraries}
+library(caret)
+library(tidyverse)
+library(prospectr)
+library(magrittr)
+library(EnvRtype)
+library(lme4)
+library(slider)
+library(magrittr)
+```
+
+Now lets load the training data
+```{r load data}
+inbred_train_data = read_csv('~/Desktop/Grad_School/Research/Inbred_NMC/Moisture_Content_Predictor/Moisture_Uptake_Master_Dataset_Cook_Macro_Spectra.csv') %>%
+  select(1,2,26:167)
+
+inbred_val_data = read_csv('~/Desktop/Grad_School/Research/Inbred_NMC/Moisture_Content_Predictor/ML_Master_Validation_Dataset.csv') %>%
+  rename(Sample_ID = SampleID)
+
+hybrid_scans = read_csv('~/Desktop/Grad_School/Research/Hybrid_NMC/Data/Scans/Hybrid_Maize_NIR_Spectra.csv')
+
+hybrid_data = read_csv('~/Desktop/Grad_School/Research/Hybrid_NMC/Data/Hybrid_Training_Data_273.csv')
+
+hybrid_val_data = read_csv('~/Desktop/Grad_School/Research/Hybrid_NMC/Data/Final_Validation_Samples.csv')
+
+# hybrid_data %>%
+#   write_csv('~/Desktop/Grad_School/Research/Hybrid_NMC/Data/Hybrid_Training_Data.csv')
+```
+
+# Assessing the Data
+## Distributions and Outliers
+
+Lets start by looking at the distributions of the inbred and hybrid cook tests.  This will include both density plots for normality and shifts, as well as box plots to look for outliers.
+```{r moisture content distributions}
+inbred_hybrid_data = inbred_train_data %>%
+  select(Sample_ID, Moisture_Uptake) %>%
+  mutate(Group = 'Inbred - Train') %>%
+  bind_rows(inbred_val_data %>%
+              select(Sample_ID, Moisture_Uptake) %>%
+              mutate(Group = 'Inbred - Validation')) %>%
+  bind_rows(hybrid_data %>%
+              rename(Moisture_Uptake = Moisture.Avg) %>%
+              mutate(Group = 'Hybrid - Train')) %>%
+  bind_rows(hybrid_val_data %>%
+              rename(Moisture_Uptake = Moisture.Avg) %>%
+              mutate(Group = 'Hybrid - Validation'))
+
+inbred_hybrid_data %>%
+  ggplot(aes(x = Moisture_Uptake, fill = Group))+
+  geom_density(alpha = 0.5)+
+  labs(title = 'Density of Moisture Uptake by Group',
+       x = 'Moisture Content')+
+  theme_classic()
+
+sd(inbred_train_data$Moisture_Uptake)
+sd(inbred_val_data$Moisture_Uptake)
+sd(hybrid_data$Moisture.Avg)
+
+t.test(inbred_train_data$Moisture_Uptake, inbred_val_data$Moisture_Uptake, var.equal = T)[3]
+t.test(inbred_train_data$Moisture_Uptake, hybrid_data$Moisture.Avg, var.equal = T)[3]
+
+inbred_hybrid_data %>%
+  ggplot(aes(x = Group, y = Moisture_Uptake, fill = Group))+
+  geom_boxplot(alpha = 0.5)+
+  geom_jitter(aes(color = Group))+
+  labs(title = 'Boxplot of Moisture Uptake by Group',
+       x = NULL,
+       y = 'Moisture Content')+
+  theme_classic()
+```
+
+The hybrids seem to fall within the bounds of the inbred training set (better than the inbred validation does by most aspects).  There are a few 'outliers' in each dataset, but most of these samples seem largely fine.  There are a couple in the hybrid dataset that have a subsample (Y or Z) that is a significant difference from the others, but with 4 replicates this is greatly reduced.
+
+The moisture distributions between inbreds (train) and hybrids are significantly difference (with an effect size of about 0.01). This could be largely driven by the fact that there are over 500 degrees of freedom.  Just to be safe, lets consider the differences in composition and spectra.
+
+## Compositional Similarity
+```{r compositional consistency}
+inbred_comp = read_csv('~/Desktop/Grad_School/Research/Inbred_NMC/Moisture_Content_Predictor/Moisture_Uptake_Master_Dataset_Cook_Macro_Spectra.csv') %>%
+  select(1,2,21:25) %>%
+  rename(Protein = Protein_As_is,
+         Starch = Starch_As_is,
+         Fat = Fat_As_is,
+         Fiber = Fiber_As_is,
+         Ash = Ash_As_is)
+
+hybrid_comp = read_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/Scans/Hybrid_Maize_Composition_Predictions.csv')
+
+inbred_hybrid_comp = hybrid_comp %>%
+  mutate(Group = 'Hybrid') %>%
+  bind_rows(inbred_comp %>%
+              select(-Genotype) %>%
+              mutate(Group = 'Inbred'))
+
+sd(inbred_comp$Protein)
+sd(hybrid_comp$Protein)
+inbred_hybrid_comp %>%
+  ggplot(aes(x = Protein, fill = Group))+
+  geom_density(alpha = 0.5)+
+  labs(title = 'Protein')+
+  scale_fill_manual(values = c('darkblue', 'darkred'), breaks = c('Inbred', 'Hybrid'))+
+  annotate('text',
+           x = 12.5,
+           y = 0.4,
+           label = paste0('p-value: ', t.test(inbred_comp$Protein, hybrid_comp$Protein, var.equal = T)[[3]]))+
+  theme_classic()+
+  theme(text = element_text(size = 20))
+
+sd(inbred_comp$Starch)
+sd(hybrid_comp$Starch)
+inbred_hybrid_comp %>%
+  ggplot(aes(x = Starch, fill = Group))+
+  geom_density(alpha = 0.5)+
+  labs(title = 'Starch')+
+  scale_fill_manual(values = c('darkblue', 'darkred'), breaks = c('Inbred', 'Hybrid'))+
+  annotate('text',
+           x = 69,
+           y = 0.4,
+           label = paste0('p-value: ', t.test(inbred_comp$Starch, hybrid_comp$Starch, var.equal = T)[[3]]))+
+  theme_classic()+
+  theme(text = element_text(size = 20))
+
+sd(inbred_comp$Fat)
+sd(hybrid_comp$Fat)
+inbred_hybrid_comp %>%
+  ggplot(aes(x = Fat, fill = Group))+
+  geom_density(alpha = 0.5)+
+  labs(title = 'Fat')+
+  scale_fill_manual(values = c('darkblue', 'darkred'), breaks = c('Inbred', 'Hybrid'))+
+  annotate('text',
+           x = 5,
+           y = 0.85,
+           label = paste0('p-value: ', t.test(inbred_comp$Fat, hybrid_comp$Fat, var.equal = T)[[3]]))+
+  theme_classic()+
+  theme(text = element_text(size = 20))
+
+sd(inbred_comp$Fiber)
+sd(hybrid_comp$Fiber)
+inbred_hybrid_comp %>%
+  ggplot(aes(x = Fiber, fill = Group))+
+  geom_density(alpha = 0.5)+
+  labs(title = 'Fiber')+
+  scale_fill_manual(values = c('darkblue', 'darkred'), breaks = c('Inbred', 'Hybrid'))+
+  annotate('text',
+           x = 1.42,
+           y = 3,
+           label = paste0('p-value: ', t.test(inbred_comp$Fiber, hybrid_comp$Fiber, var.equal = T)[[3]]))+
+  theme_classic()+
+  theme(text = element_text(size = 20))
+
+sd(inbred_comp$Ash)
+sd(hybrid_comp$Ash)
+inbred_hybrid_comp %>%
+  ggplot(aes(x = Ash, fill = Group))+
+  geom_density(alpha = 0.5)+
+  labs(title = 'Ash')+
+  scale_fill_manual(values = c('darkblue', 'darkred'), breaks = c('Inbred', 'Hybrid'))+
+  annotate('text',
+           x = 1.6,
+           y = 4,
+           label = paste0('p-value: ', t.test(inbred_comp$Ash, hybrid_comp$Ash, var.equal = T)[[3]]))+
+  theme_classic()+
+  theme(text = element_text(size = 20))
+```
+
+
+## Spectral Consistancy
+
+Let's look to see if the spectra seem 'overlapped'.  This will be done by creating a PCA with the inbred data and the hybrid data will be predicted into the same coordinate space. 
+```{r spectral coordinate space}
+hybrid_data %>%
+  select(Sample_ID, Moisture.Avg, 7:147) %>%
+  pivot_longer(cols = -c(Sample_ID), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, group = Sample_ID))+
+  geom_line()+
+  theme_classic()
+  
+
+inbred_train_pca = prcomp(inbred_train_data[,4:144], scale. = T, center = T)
+
+inbred_train_pcs = inbred_train_pca$x[,1:2]
+inbred_val_pcs = predict(inbred_train_pca, inbred_val_data[-1,9:149])[,1:2]
+hybrid_pcs = predict(inbred_train_pca, hybrid_data[,7:147])[,1:2]
+new_hybrids_pcs = predict(inbred_train_pca, hybrid_scans)[,1:2]
+
+inbred_train_pcs %>%
+  as_tibble() %>%
+  mutate(Group = 'Inbred - Train') %>%
+  bind_rows(inbred_val_pcs %>%
+              as_tibble() %>%
+              mutate(Group = 'Inbred - Validation')) %>%
+  bind_rows(hybrid_pcs %>%
+              as_tibble() %>%
+              mutate(Group = 'Hybrid - Cooked')) %>%
+  bind_rows(new_hybrids_pcs %>%
+              as_tibble() %>%
+              mutate(Group = 'Hybrid - New')) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Group))+
+  geom_point(alpha = 0.5)+
+  labs(title = 'PCA of Scans in Inbred Training Coordinate Space')+
+  theme_classic()
+```
+
+The hybrid samples appear to all fall within the coordinate space of the inbreds, suggesting they are not more spectrally extreme.
+
+## Spectral and Moisture Correlation
+
+Now let's look at the correlations between moisture content and waveband absorbance for inbreds and hybrids
+```{r absorbance and moisture correlations}
+waveband_correlations = tibble(Waveband = NULL,
+                               PearsonR = NULL,
+                               Group = NULL,
+                               lwr = NULL,
+                               upr = NULL)
+
+for(wav in as.character(seq(950, 1650, 5))){
+  waveband_correlations = waveband_correlations %>%
+    bind_rows(tibble(Waveband = as.numeric(wav),
+                     Pearson_R = cor.test(inbred_train_data[[wav]], inbred_train_data$Moisture_Uptake)[[4]],
+                     Group = 'Inbred',
+                     lwr = cor.test(inbred_train_data[[wav]], inbred_train_data$Moisture_Uptake)[[9]][1],
+                     upr = cor.test(inbred_train_data[[wav]], inbred_train_data$Moisture_Uptake)[[9]][2])) %>%
+    bind_rows(tibble(Waveband = as.numeric(wav),
+                     Pearson_R = cor.test(hybrid_data[[wav]], hybrid_data$Moisture.Avg)[[4]],
+                     Group = 'Hybrid',
+                     lwr = cor.test(hybrid_data[[wav]], hybrid_data$Moisture.Avg)[[9]][1],
+                     upr = cor.test(hybrid_data[[wav]], hybrid_data$Moisture.Avg)[[9]][2]))
+}
+
+
+
+waveband_correlations %>%
+  ggplot(aes(x = Waveband, y = Pearson_R^2, ymin = lwr^2, ymax = upr^2, fill = Group, color = Group, group = Group))+
+  geom_ribbon(alpha = 0.5, show.legend = F)+
+  geom_point()+
+  labs(x = 'Waveband',
+       y = 'Proportion of Variance Explained (R^2)',
+       title = 'Correlation between Moisture Content and Spectral Absorbances')+
+  ylim(0,1)+
+  scale_color_manual(values = c('darkblue', 'darkred'), breaks = c('Inbred', 'Hybrid'))+
+  scale_fill_manual(values = c('darkblue', 'darkred'), breaks = c('Inbred', 'Hybrid'))+
+  theme_classic()
+```
+
+The correlation between wavebands and moisture content is lower for the hybrids than it was for the inbreds (0.45 compared to 0.57).  The correlations at wavebands between inbreds and hybrids is correlated though, indicating that they follow the same pattern, just don't explain quite as much variation.
+
+## Relationship between wavebands
+
+There is a decent amount of variation amongst the wavebands in terms of how correlated they are with moisture content.  Perhaps we can utilize the more highly correlated samples (if they are different enough from other wavebands). Lets start by looking at how correlated the wavebands are with each other.
+
+```{r interwaveband correlations}
+cor(inbred_train_data %>%
+                select(-Sample_ID, -Genotype) %>%
+                as.matrix())[-1,-1] %>%
+  as_tibble() %>%
+  mutate(Waveband_1 = seq(950,1650,5), .before = '950') %>%
+  pivot_longer(cols = -Waveband_1, names_to = 'Waveband_2', values_to = 'Correlation') %>%
+  mutate(Waveband_1 = as.numeric(Waveband_1),
+         Waveband_2 = as.numeric(Waveband_2)) %>%
+  ggplot(aes(x = Waveband_1, y = Waveband_2, fill = Correlation, color = Correlation))+
+  geom_tile(size = 0.3)+
+  scale_x_continuous(limits = c(950,1650), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(950,1650), expand = c(0, 0)) +
+  scale_fill_gradientn(colors = c("white", "blue"), limits = c(0,1))+
+  scale_color_gradientn(colors = c("white", "blue"), limits = c(0,1))+
+  labs(title = 'Correlation between Wavebands in Inbred Training Set',
+       x = 'Waveband 1',
+       y = 'Waveband 2')+
+  theme_classic()
+
+cor(hybrid_data %>%
+                select(-Sample_ID, -Genotype, -Moisture.Avg, -Location, - Source, -Experiment) %>%
+                as.matrix()) %>%
+  as_tibble() %>%
+  mutate(Waveband_1 = seq(950,1650,5), .before = '950') %>%
+  pivot_longer(cols = -Waveband_1, names_to = 'Waveband_2', values_to = 'Correlation') %>%
+  mutate(Waveband_1 = as.numeric(Waveband_1),
+         Waveband_2 = as.numeric(Waveband_2)) %>%
+  ggplot(aes(x = Waveband_1, y = Waveband_2, fill = Correlation, color = Correlation))+
+  geom_tile(size = 0.3)+
+  scale_x_continuous(limits = c(950,1650), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(950,1650), expand = c(0, 0)) +
+  scale_fill_gradientn(colors = c("white", "blue"), limits = c(0,1))+
+  scale_color_gradientn(colors = c("white", "blue"), limits = c(0,1))+
+  labs(title = 'Correlation between Wavebands in Hybrid Set',
+       x = 'Waveband 1',
+       y = 'Waveband 2')+
+  theme_classic()
+```
+
+Interestingly, the inbreds have a couple areas that are less correlated with each other than others, but are still highly correlated (R >= 0.8).  The Hybrids however, are more highly correlated between the wavebands, with the no correlation below R = 0.9.  This lack of new information from additional wavebands will be problematic and could explain why the inbred does not do a very good job predicting moisture content in hybrids.
+
+# Evaluating the the inbred model on hybrids
+## Training and validating the inbred model
+To start, we will train the SVML model from Burns et al. 2021 and verify it is the same by testing its performance on the inbred validation dataset.
+
+Start by performing an absolute value normalization of the training and validation data
+```{r normalizing training data}
+training_norm <- inbred_train_data %>%
+  pivot_longer(cols = -c(Sample_ID, Genotype, Moisture_Uptake), names_to = "Waveband", values_to = "Absorbance") %>%
+  group_by(Sample_ID) %>%
+  mutate(sum_lxl_abs = sum(abs(Absorbance)),
+         Norm_Abs = Absorbance / sum_lxl_abs) %>%
+  select(-c(Absorbance, sum_lxl_abs)) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = c(Sample_ID, Genotype, Moisture_Uptake), 
+              values_from = Norm_Abs, 
+              names_from = Waveband)
+
+validation_norm <- inbred_val_data %>%
+  filter(Sample_ID != 'YC16:1029') %>%
+  select(-c(3:8)) %>%
+  pivot_longer(cols = -c(Sample_ID, Genotype), names_to = "Waveband", values_to = "Absorbance") %>%
+  group_by(Sample_ID) %>%
+  mutate(sum_lxl_abs = sum(abs(Absorbance)),
+         Norm_Abs = Absorbance / sum_lxl_abs) %>%
+  select(-c(Absorbance, sum_lxl_abs)) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = c(Sample_ID, Genotype), 
+              values_from = Norm_Abs, 
+              names_from = Waveband)
+```
+
+```{r training and validating inbred model}
+svml_model = train(Moisture_Uptake ~ ., 
+                        data = training_norm %>%
+                          select_if(is.numeric), 
+                        method = "svmLinear", 
+                        metric = "Rsquared", 
+                        tuneGrid = expand.grid(C = 71.407),
+                        trControl = trainControl(method = "cv",
+                                                 index = groupKFold(training_norm$Genotype, k = 10), 
+                                                 savePredictions = T,
+                                                 allowParallel = T
+                                                 )
+                        )
+
+val_predictions = predict(svml_model, validation_norm)
+
+val_interpolate_index = val_predictions > min(inbred_train_data$Moisture_Uptake) & val_predictions < max(inbred_train_data$Moisture_Uptake)
+
+cor_inbred_val = inbred_val_data %>%
+  filter(Sample_ID != 'YC16:1029') %>%
+  select(Moisture_Uptake) %>%
+  mutate(Predictions = val_predictions,
+         Keep = val_interpolate_index) %>%
+  filter(Keep == T) %$%
+  cor(Moisture_Uptake, Predictions, method = 'spearman')
+
+actual_pred_rel_model = lm(inbred_val_data$Moisture_Uptake[-1][val_interpolate_index] ~ val_predictions[val_interpolate_index])
+inbred_pred_interval = as_tibble(predict(actual_pred_rel_model, newdata = tibble(val_predictions[val_interpolate_index]), interval = 'predict'))
+
+inbred_val_data %>%
+  filter(Sample_ID != 'YC16:1029') %>%
+  mutate(Predictions = val_predictions,
+         Keep = val_interpolate_index) %>%
+  filter(Keep == T) %>%
+  bind_cols(inbred_pred_interval) %>%
+  select(Moisture_Uptake, Predictions, lwr, upr) %>%
+  ggplot(aes(x = Predictions, y = Moisture_Uptake))+
+  geom_ribbon(aes(ymin = lwr, ymax = upr), fill = 'gray80')+
+  geom_abline(slope = 1, linetype = 'dashed', size = 1, color = 'gray40')+
+  geom_point()+
+  geom_smooth(se = F, method = 'lm', color = 'black')+
+  labs(x = 'Actual Moisture Content',
+       y = 'Predicted Moisture Content',
+       title = 'Validation of Inbred Model Performance')+
+  annotate('text', label = paste0('Spearman R: ', round(cor_inbred_val, 3)), x = 0.48, y = 0.4)+
+  theme_classic()
+```
+
+This looks right. The correlation is a little lower than it was in Burns et al. 2021, but I assume I am not filtering quite right.
+
+Lets try this model on the hybrid scan data that I have.
+
+## Testing the inbred model on hybrid data
+```{r testing inbred model on hybrids}
+# Normalize new data
+hybrid_norm <- hybrid_data %>%
+  pivot_longer(cols = -c(Sample_ID, Genotype, Moisture.Avg, Location, Source, Experiment), names_to = "Waveband", values_to = "Absorbance") %>%
+  group_by(Sample_ID) %>%
+  mutate(sum_lxl_abs = sum(abs(Absorbance)),
+         Norm_Abs = Absorbance / sum_lxl_abs) %>%
+  select(-c(Absorbance, sum_lxl_abs)) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = c(Sample_ID, Genotype, Moisture.Avg, Location, Source, Experiment), 
+              values_from = Norm_Abs, 
+              names_from = Waveband)
+
+# Save the correlation value
+cor_inbred_hybrid = hybrid_norm %>%
+  select(Moisture.Avg) %>%
+  mutate(Predictions = predict(svml_model, hybrid_norm)) %$%
+  cor(Moisture.Avg, Predictions, method = 'spearman')
+
+# Model the linear relationship between predicted and actual moisture content
+actual_pred_rel_model = lm(hybrid_norm$Moisture.Avg ~ predict(svml_model, hybrid_norm))
+
+# Extract the upper and lower confidence prediction intervals
+hybrid_pred_interval = as_tibble(predict(actual_pred_rel_model, newdata = tibble(predict(svml_model, hybrid_norm)), interval = 'predict'))
+
+# Plot the correlation between predicted and actual moisture content
+hybrid_norm %>%
+  bind_cols(hybrid_pred_interval) %>% # combine hybrid data with prediction intervals
+  left_join(hybrid_data %>% select(Sample_ID, Experiment)) %>%
+  select(Moisture.Avg, lwr, upr, Experiment) %>% # Select the values needed for plotting
+  mutate(Predictions = predict(svml_model, hybrid_norm)) %>% # Add the moisture content predictions
+  ggplot(aes(x = Predictions, y = Moisture.Avg, color = Experiment))+
+  geom_ribbon(aes(ymin = lwr, ymax = upr), fill = 'gray80')+ # Plot the prediciton interval
+  geom_abline(slope = 1, linetype = 'dashed', size = 1, color = 'gray40')+ # Plot a 1:1 line for comparison
+  geom_point()+
+  geom_smooth(se = F, method = 'lm')+ # Plot the trendline without the standard error
+  geom_smooth(se = F, method = 'lm', color = 'black')+
+  labs(x = 'Predicted Moisture Content',
+       y = 'Actual Moisture Content',
+       title = 'Inbred Model Performance on Hybrid Data')+
+  annotate('text', label = paste0('Spearman R: ', round(cor_inbred_hybrid, 3)), x = 0.46, y = 0.4)+ # Add the correlation value to the plot
+  theme_classic()
+```
+
+It appears that while the hybrids are much worse at predicting moisture content (from inbred data) the prediction interval is much tighter.  This could paritally be due to the fact that there are about 5 times as many samples.  From what I could tell, the prediction interval for inbreds is about 0.18 whereas hybrids are around 0.05.  The problem here is that the inbreds have a much larger dynamic range than the hybrids, so the hybrids look significantly worse, and they are more confident that they are worse.
+
+Maybe linear SVMs just aren't very good at predicting across these genetic and environmental differences.  We should try a few different models to see if they can outperform the linear SVM on hybrid data (regardless of how they perform on the inbred validation data).
+
+Lets look at the error associated with cook tests on inbreds and hybrids compared to the RMSE of the prediction model.  It is possible that one group has a higher error rate to begin with and is causing a lack of predictability.
+```{r errors}
+# standard error of inbreds
+sd(inbred_train_data$Moisture_Uptake) / sqrt(length(inbred_train_data$Moisture_Uptake))
+# standard error of hybrids
+sd(hybrid_data$Moisture.Avg) / sqrt(length(hybrid_data$Moisture.Avg))
+# mean absolute error of inbred on inbred predictions
+MAE(val_predictions, inbred_val_data$Moisture_Uptake[-1])
+# mean absolute error of inbred on hybrid predictions
+MAE(predict(svml_model, hybrid_norm), hybrid_data$Moisture.Avg)
+```
+
+The errors of both the cook tests and the predictions are about half in the hybrids as they are in the inbreds.  The could be due to the lack of range of values for hybrids and may constitute cooking more hybrids to fill in extreme ends of the correlation plot.  Some of these hybrids may not be food grade though in order to get enough variation to be useful on hybrids as a general genetic system.
+
+# Assessing new inbred model possibilities
+## Some common, high performing models
+For this I am going to try using a PLS model, PCR model, and a neural network model.  The idea behind this is that the PLS and PCR work in similar but different ways and may be able to glean useful information during the data-reduction that will allow it to be more generalizable.  The NN model is meant to account for a higher level of learning that may be able to sort out issues that simpler models cannot.  The issue will be trying to make sure it is not overfit.
+
+```{r training pls pcr and nn models on base inbred data}
+pls_inbred_model = train(Moisture_Uptake ~ ., 
+                        data = inbred_train_data %>%
+                          select_if(is.numeric), 
+                        method = "pls", 
+                        metric = "RMSE", 
+                        tuneGrid = expand.grid(ncomp = c(14,15,16)),
+                        trControl = trainControl(method = "cv",
+                                                 index = groupKFold(training_norm$Genotype, k = 10), 
+                                                 savePredictions = T,
+                                                 allowParallel = T
+                                                 )
+                        )
+
+pcr_inbred_model = train(Moisture_Uptake ~ ., 
+                        data = inbred_train_data %>%
+                          select_if(is.numeric), 
+                        method = "pcr", 
+                        metric = "RMSE", 
+                        tuneGrid = expand.grid(ncomp = c(5,6,7)),
+                        trControl = trainControl(method = "cv",
+                                                 index = groupKFold(training_norm$Genotype, k = 10), 
+                                                 savePredictions = T,
+                                                 allowParallel = T
+                                                 )
+                        )
+
+nn_inbred_model = train(Moisture_Uptake ~ ., 
+                        data = inbred_train_data %>%
+                          select_if(is.numeric), 
+                        method = "neuralnet", 
+                        metric = "RMSE",
+                        preProc = c("center", "scale", "nzv"),
+                        tuneGrid = expand.grid(layer1 = c(1),
+                                               layer2 = c(0),
+                                               layer3 = c(0)),
+                        trControl = trainControl(method = "cv",
+                                                 index = groupKFold(training_norm$Genotype, k = 10), 
+                                                 savePredictions = T,
+                                                 allowParallel = T
+                                                 )
+                        )
+```
+
+
+Now that the models are trained, lets see if they perform any better on the hybrid data.
+```{r testing pls and pcr on hybrid data}
+pls_in_hy_pred = predict(pls_inbred_model, hybrid_data)
+pcr_in_hy_pred = predict(pcr_inbred_model, hybrid_data)
+nn_in_hy_pred = predict(nn_inbred_model, hybrid_data)
+
+cor(pls_in_hy_pred, hybrid_data$Moisture.Avg)
+cor(pcr_in_hy_pred, hybrid_data$Moisture.Avg)
+cor(nn_in_hy_pred, hybrid_data$Moisture.Avg)
+```
+
+None of these models perform extremely well, and actually perform a little worse than the inbred model.  Given that error should be random in these predictions (and thus not predictable itself), and the models may not not actually be correlated with each other, maybe we can average the predictions to get a more robust answer (bagging).
+```{r bagging inbred models}
+tibble(inbred_model = predict(svml_model, hybrid_norm),
+       pls_model = pls_in_hy_pred,
+       pcr_model = pcr_in_hy_pred,
+       nn_model = nn_in_hy_pred) %>%
+  mutate(actual = hybrid_data$Moisture.Avg) %>%
+  rowwise() %>%
+  mutate(average_model = mean(c(pls_model, nn_model))) %$%
+  cor(.)
+```
+
+It looks like bagging can improve the model (using the two most divergent models with decent accuracy), but not a significant amount over the inbred model. Perhaps adding more models that are significantly different in training methodology would enhance the prediction, but given that averaging two models only improved the pearson R by 0.02, I don't think this is worth pursuing as I assume adding models will have diminishing or detrimental returns.
+
+There is a very slight, though minimal improvement in the models based on the base (non-transformed, non-normalized) inbred data.  It is possible that another model would improve it further, but likely not enough to be significant.
+
+Perhaps developing a model based on properly transformed / normalized data would improve the predictions.
+
+## Pre-processing the NIR data
+```{r normalizing inbred and hybrid data first step}
+# # Single Normal Variate
+# snv_inbred = inbred_train_data %>%
+#   select(1:3) %>%
+#   bind_cols(as_tibble(standardNormalVariate(inbred_train_data[,4:144]))) 
+# snv_hybrid = hybrid_data %>%
+#   select(1:2) %>%
+#   bind_cols(as_tibble(standardNormalVariate(hybrid_data[,4:144]))) 
+# 
+# # Detrend - 2nd Order Derivative (Perkin)
+# detrend_inbred = inbred_train_data %>%
+#   select(1:3) %>%
+#   bind_cols(as_tibble(detrend(inbred_train_data[,4:144], wav = as.numeric(colnames(inbred_train_data[,4:144])), p = 2))) 
+# detrend_hybrid = hybrid_data %>%
+#   select(1:2) %>%
+#   bind_cols(as_tibble(detrend(hybrid_data[,4:144], wav = as.numeric(colnames(hybrid_data[,4:144])), p = 2))) 
+# 
+# # Baseline Correction
+# baseline_inbred = inbred_train_data %>%
+#   select(1:3) %>%
+#   bind_cols(as_tibble(baseline(X = inbred_train_data[,4:144], wav = as.numeric(colnames(inbred_train_data[,4:144])))))
+# baseline_hybrid = hybrid_data %>%
+#   select(1:2) %>%
+#   bind_cols(as_tibble(baseline(X = hybrid_data[,4:144], wav = as.numeric(colnames(hybrid_data[,4:144])))))
+# 
+# # Savitsky Golay Derivative
+# sg_inbred = inbred_train_data %>%
+#   select(1:3) %>%
+#   bind_cols(as_tibble(savitzkyGolay(X = inbred_train_data[,4:144], m = 1, p = 2, w = 11))) 
+# sg_hybrid = hybrid_data %>%
+#   select(1:2) %>%
+#   bind_cols(as_tibble(savitzkyGolay(X = hybrid_data[,4:144], m = 1, p = 2, w = 11))) 
+```
+
+```{r test each of the data normalizations}
+# model_testing = function(train, test, model, hyperparameters){
+#   model = train(Moisture_Uptake ~ ., 
+#                 data = train %>%
+#                   select_if(is.numeric), 
+#                 method = model, 
+#                 metric = "RMSE", 
+#                 tuneGrid = hyperparameters,
+#                 trControl = trainControl(method = "cv",
+#                                          index = groupKFold(training_norm$Genotype, k = 10), 
+#                                          savePredictions = T,
+#                                          allowParallel = T
+#                                          )
+#                 )
+#   
+#   return(cor(predict(model, test), test$Moisture.Avg))
+# }
+# 
+# performances = tibble(data_source = NULL,
+#                       model = NULL,
+#                       performance = NULL)
+# for(i in 1:20){
+#   print(i)
+#   for(dat in c('none', 'snv', 'detrend', 'baseline', 'sg')){
+#   if(dat == 'snv'){
+#     train = snv_inbred
+#     test = snv_hybrid
+#   } else{
+#     if(dat == 'detrend'){
+#       train = detrend_inbred
+#       test = detrend_hybrid
+#     } else{
+#       if(dat == 'baseline'){
+#         train = baseline_inbred
+#         test = baseline_hybrid
+#       } else{
+#         if(dat == 'sg'){
+#           train = sg_inbred
+#           test = sg_hybrid
+#         } else {
+#           train = inbred_train_data
+#           test = hybrid_data
+#         }
+#       }
+#     }
+#   }   
+#   for(mod in c('pls', 'pcr', 'neuralnet')){
+#     if(mod == 'pls'){
+#       hyperparameters = expand.grid(ncomp = c(15))
+#     } else{
+#       if(mod == 'pcr'){
+#         hyperparameters = expand.grid(ncomp = c(6))
+#       } else{
+#         hyperparameters = expand.grid(layer1 = c(1),
+#                                       layer2 = c(0),
+#                                       layer3 = c(0))
+#       }
+#     }
+#     set.seed(i)
+#     performance = model_testing(train, test, mod, hyperparameters)
+#     
+#     performances = performances %>%
+#       bind_rows(tibble(data_source = dat,
+#                        model = mod,
+#                        performance = performance))
+#   }
+# }
+# }
+# 
+# performances %>%
+#   mutate(performance = performance^2) %>%
+#   ggplot(aes(x = data_source, y = performance, color = data_source, fill = data_source))+
+#   geom_violin(alpha = 0.5, show.legend = F)+
+#   geom_jitter(show.legend = F)+
+#   stat_summary(color = 'black', show.legend = F)+
+#   facet_wrap(~model)+
+#   labs(title = 'Performance of Inbred Models on Hybrid Data with Various Preprocesses',
+#        x = NULL,
+#        y = 'Pearson R^2')+
+#   theme_classic()+
+#   theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+The neural network datasets are far more variable than the other models.  I think this is because there are many hyperparameters that caret will not let me modify, but likely have sampled values (based on the source code).  The other models are relatively simple and are more consistent because of it.
+
+These models and normalizations are not improving the performances of the models much (if at all), and it doesn't really make sense to keep pursuing them.  I think the best course of action will be to create a model based solely on hybrid data.
+
+# Hybrid Models
+```{r split hybrid data into training and validation sets}
+hybrid_genos_xref = read_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/XRefs/Hybrid_Genotypes_XRef.csv')
+
+hybrid_data_with_genos = hybrid_genos_xref %>%
+  right_join(hybrid_data) %>%
+  mutate(Genotype = case_when(is.na(Genotype) ~ Sample_ID,
+                              !is.na(Genotype) ~ Genotype))
+
+validation_genos = hybrid_data_with_genos %>%
+  select(Genotype) %>%
+  unique() %>%
+  sample_frac(0.2) %>%
+  pull()
+
+hybrid_validation = hybrid_data_with_genos %>%
+  filter(Genotype %in% validation_genos) %>%
+  select(-Genotype)
+
+hybrid_train = hybrid_data_with_genos %>%
+  filter(!Genotype %in% validation_genos)
+```
+
+```{r check how interspersed genotypes are for spectra}
+geno_scan_data = hybrid_scans %>%
+  left_join(hybrid_genos_xref) %>%
+  select(Genotype) %>%
+  bind_cols(prcomp(hybrid_scans[,6:146], center = T, scale. = T)$x %>% as_tibble()) %>%
+  pivot_longer(cols = -Genotype,
+               names_to = 'PCs',
+               values_to = 'Eigenvalue') %>%
+  group_by(Genotype, PCs) %>%
+  summarise(Eigenvalue = mean(Eigenvalue)) %>%
+  ungroup() %>%
+  pivot_wider(id_cols = PCs, names_from = Genotype, values_from = Eigenvalue) %>%
+  select(-PCs) %>%
+  cor()
+
+heatmap(geno_scan_data)
+legend(x="topright", legend = c(min(geno_scan_data), max(geno_scan_data)), fill=heat.colors(2))
+```
+
+This heatmap shows significant blocking and structure, suggesting that splitting the data by genotype should be more appropriate than LOOCV.
+
+```{r train models}
+svml_hybrid_model = train(Moisture.Avg ~ ., 
+                        data = hybrid_train %>%
+                          select(-c(Sample_ID, Genotype, Location, Year, Source, Experiment)), 
+                        method = "svmLinear", 
+                        metric = "Rsquared", 
+                        tuneGrid = expand.grid(C = 71.407),
+                        trControl = trainControl(method = "cv",
+                                                 index = groupKFold(hybrid_train$Genotype, k = 10), 
+                                                 savePredictions = T,
+                                                 allowParallel = T
+                                                 )
+                        )
+
+pls_hybrid_model = train(Moisture.Avg ~ ., 
+                        data = hybrid_train %>%
+                          select(-c(Sample_ID, Genotype, Location, Year, Source, Experiment)), 
+                        method = "pls", 
+                        metric = "Rsquared", 
+                        tuneGrid = expand.grid(ncomp = 15),
+                        trControl = trainControl(method = "cv",
+                                                 index = groupKFold(hybrid_train$Genotype, k = 10), 
+                                                 savePredictions = T,
+                                                 allowParallel = T
+                                                 )
+                        )
+
+paste0('SVM Linear RMSE: ', RMSE(pred = predict(svml_hybrid_model, hybrid_validation), obs = hybrid_validation$Moisture.Avg))
+
+paste0('PLS RMSE: ', RMSE(pred = predict(pls_hybrid_model, hybrid_validation), obs = hybrid_validation$Moisture.Avg))
+
+paste0('SVM Linear Pearson R: ', cor(y = predict(svml_hybrid_model, hybrid_validation), x = hybrid_validation$Moisture.Avg))
+
+paste0('PLS Pearson R: ', cor(y = predict(pls_hybrid_model, hybrid_validation), x = hybrid_validation$Moisture.Avg))
+
+ggplot(mapping = aes(x = predict(svml_hybrid_model, hybrid_validation), y = hybrid_validation$Moisture.Avg))+
+  geom_point()+
+  geom_abline()+
+  geom_smooth(se = F, method = 'lm')+
+  labs(title = 'Hybrid on Hybrid SVM Model',
+       x = 'Predicted Moisture Content',
+       y = 'Actual Moisture Content')+
+  theme_classic()
+
+ggplot(mapping = aes(x = predict(pls_hybrid_model, hybrid_validation), y = hybrid_validation$Moisture.Avg))+
+  geom_point()+
+  geom_abline()+
+  geom_smooth(se = F, method = 'lm')+
+  labs(title = 'Hybrid on Hybrid PLS Model',
+       x = 'Predicted Moisture Content',
+       y = 'Actual Moisture Content')+
+  theme_classic()
+```
+
+
+The hybrid data is predicting pretty well!  Perhaps doing some spectral pre-treatments will help or make it more robust.
+
+Descatter the the data with a single normal variate and remove the baseline with a detrend (done in this order with the detrend function)
+```{r descatter and detrend}
+snv_data = hybrid_train %>%
+  select(1:7) %>%
+  bind_cols(as_tibble(detrend(hybrid_train[,8:148], wav = as.numeric(colnames(hybrid_train[,8:148])), p = 2))) 
+
+snv_svml_model = train(Moisture.Avg ~ ., 
+                        data = snv_data %>%
+                          select_if(is.numeric), 
+                        method = "svmLinear", 
+                        metric = "Rsquared", 
+                        tuneGrid = expand.grid(C = 71.407),
+                        trControl = trainControl(method = "cv",
+                                                 index = groupKFold(snv_data$Genotype, k = 10), 
+                                                 savePredictions = T,
+                                                 allowParallel = T
+                                                 )
+                        )
+
+snv_pls_model = train(Moisture.Avg ~ ., 
+                        data = snv_data %>%
+                          select_if(is.numeric), 
+                        method = "pls", 
+                        metric = "Rsquared", 
+                        tuneGrid = expand.grid(ncomp = 15),
+                        trControl = trainControl(method = "cv",
+                                                 index = groupKFold(snv_data$Genotype, k = 10), 
+                                                 savePredictions = T,
+                                                 allowParallel = T
+                                                 )
+                        )
+
+val_snv = hybrid_validation %>%
+  select(1:6) %>%
+  bind_cols(as_tibble(detrend(hybrid_validation[,7:147], wav = as.numeric(colnames(hybrid_validation[,7:147])), p = 2))) 
+
+paste0('SVM Linear RMSE: ', RMSE(pred = predict(snv_svml_model, val_snv), obs = val_snv$Moisture.Avg))
+
+paste0('PLS RMSE: ', RMSE(pred = predict(snv_pls_model, val_snv), obs = val_snv$Moisture.Avg))
+
+paste0('SVM Linear Pearson R: ', cor(y = predict(snv_svml_model, val_snv), x = val_snv$Moisture.Avg))
+
+paste0('PLS Pearson R: ', cor(y = predict(snv_pls_model, val_snv), x = val_snv$Moisture.Avg))
+
+val_snv %>%
+  select(Moisture.Avg) %>%
+  mutate(MC_Pred = predict(snv_svml_model, val_snv)) %>%
+  ggplot(aes(x = Moisture.Avg, y = MC_Pred))+
+  geom_smooth(se = F, method = 'lm')+
+  geom_point()+
+  geom_abline()+
+  theme_classic()
+
+val_snv %>%
+  select(Moisture.Avg) %>%
+  mutate(MC_Pred = predict(snv_pls_model, val_snv)) %>%
+  ggplot(aes(x = Moisture.Avg, y = MC_Pred))+
+  geom_smooth(se = F, method = 'lm')+
+  geom_point()+
+  geom_abline()+
+  theme_classic()
+```
+
+Derive the wavebands (first order).  I am using the second order derivative as it removes both baseline and linear trend (and thus hopefully less noise), s = 3 (average 3 wavebands, each is 5nm apart, which comes out to 15nm in distance that is 'averaged'), w = 3 (get the derivative from points that have 2 points (3 gaps) between them).
+```{r derivative of absorbances}
+baseline_data = snv_data %>%
+  select(1:7) %>%
+  bind_cols(as_tibble(baseline(X = snv_data[,8:148], wav = as.numeric(colnames(snv_data[,8:148])))))
+
+baseline_data %>%
+  select(-Genotype) %>%
+  pivot_longer(cols = -c(Sample_ID, Moisture.Avg, Location, Source, Experiment, Year), names_to = 'Waveband', values_to = 'Absorbance') %>%
+  mutate(Waveband = as.numeric(Waveband)) %>%
+  ggplot(aes(x = Waveband, y = Absorbance, color = Moisture.Avg, group = Sample_ID))+
+  geom_line()+
+  theme_classic()
+
+baseline_model = train(Moisture.Avg ~ ., 
+                        data = baseline_data %>%
+                          select_if(is.numeric), 
+                        method = "pls", 
+                        metric = "Rsquared", 
+                        tuneGrid = expand.grid(ncomp = 15),
+                        trControl = trainControl(method = "cv",
+                                                 index = groupKFold(baseline_data$Genotype, k = 10), 
+                                                 savePredictions = T,
+                                                 allowParallel = T
+                                                 )
+                        )
+
+val_bsln = val_snv %>%
+  select(1:6) %>%
+  bind_cols(as_tibble(baseline(X = val_snv[,7:147], wav = as.numeric(colnames(val_snv[,7:147]))))) 
+
+cor(val_bsln$Moisture.Avg, predict(baseline_model, val_bsln))
+
+val_bsln %>%
+  select(Moisture.Avg) %>%
+  mutate(MC_Pred = predict(baseline_model, val_bsln)) %>%
+  ggplot(aes(x = Moisture.Avg, y = MC_Pred))+
+  geom_smooth(se = F, method = 'lm')+
+  geom_point()+
+  geom_abline()+
+  theme_classic()
+```
+
+There is a pretty significant improvement by using the hybrid data. There is a chance some of this is due to random chance (maybe the validation set is particularly beneficial and I am just getting lucky).  To check this, I will continue using PLS and SVML models with base, SNV, and baseline corrected spectra.  I will bootstrap them many times to see which performs the best on average and see if there is a clear best model combination (considering both accuracy and consistency).
+
+# Hybrid Model Bootstrapping
+```{r environmental group analyses}
+### UMN Commercial Hybrid Panel ###
+data = hybrid_data_with_genos %>%
+  filter(str_detect(Sample_ID, '^CH22')) %>%
+  select(Genotype, Sample_ID, Moisture.Avg) %>%
+  separate(Sample_ID, into = c('Exp', 'Plot'), sep = ':') %>%
+  select(-Exp) %>%
+  mutate(Plot = as.numeric(str_extract(Plot, '^[1-4]')),
+         Location = case_when(Plot < 3 ~ 'StPaul',
+                              Plot > 2 ~ 'Waseca'),
+         Rep = as.factor(case_when((Plot %% 2) != 0 ~ 1,
+                                   (Plot %% 2) == 0 ~ 2)))
+
+model = lmer(Moisture.Avg ~ (1 | Genotype) + (1 | Location) + (1 | Genotype:Location) + (1 | Location:Rep), data = data)
+
+summary(model)$varcor %>%
+  as_tibble() %>%
+  mutate(Total_SS = sum(vcov),
+         PVE = vcov / Total_SS) %>%
+  ggplot(aes(x = factor(grp, levels = c('Residual',
+                                             'Location:Rep',
+                                             'Genotype:Location',
+                                             'Location',
+                                             'Genotype')),
+             y = PVE))+
+  geom_bar(stat = 'identity')+
+  labs(x = NULL,
+       y = 'Proportion of Variation Explained',
+       title = 'Commercial Hybrids Grown in St. Paul and Waseca')+
+  coord_flip()+
+  theme_classic()
+
+levels = data %>%
+  group_by(Genotype) %>%
+  summarise(mean_MC = mean(Moisture.Avg)) %>%
+  arrange(mean_MC) %>%
+  select(Genotype) %>%
+  pull()
+
+data %>%
+  mutate(GE = paste0(Genotype, Location)) %>%
+  ggplot(aes(x = factor(Genotype, levels = levels), y = Moisture.Avg))+
+  geom_point(color = 'gray40')+
+  stat_summary()+
+  labs(x = NULL,
+       y = 'Cook Test Moisture Content')+
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+### Pioneer 20 hybrids in 7 locations ###
+multi_env_locs = c('Bement', 'Charleston', 'Covington', 'Dewey', 'Indianola', 'Ivesdale', 'St. Joseph', 'Potomac', 'Sydney')
+pioneer_multi_env = hybrid_data_with_genos %>%
+  separate(Location, into = c('City', 'State', sep = ', ')) %>%
+  filter(City %in% multi_env_locs)
+
+# NOT ENOUGH COOKED SAMPLES
+
+### Pioneer 8 hybrid in 5 locations ###
+PA_XRef = read_csv('~/Desktop/Grad_School/Research/Hybrid_NMC/Data/XRefs/PA_Hybrids_XRef.csv') %>%
+  mutate(Sample_ID = paste0('PA_', Barcode)) %>%
+  rename(Genotype = GE)
+
+PA_Samples_Cooked = hybrid_data_with_genos %>%
+  filter(str_detect(Sample_ID, '^PA_')) %>%
+  select(1,2,144) %>%
+  left_join(PA_XRef)
+
+model = lmer(Moisture.Avg ~ (1 | Genotype) + (1 | Location) + (1 | Genotype:Location) + (1 | Location:Rep), data = PA_Samples_Cooked)
+
+summary(model)$varcor %>%
+  as_tibble() %>%
+  mutate(Total_SS = sum(vcov),
+         PVE = vcov / Total_SS) %>%
+  ggplot(aes(x = factor(grp, levels = c('Residual',
+                                        'Location:Rep',
+                                        'Genotype:Location',
+                                        'Location',
+                                        'Genotype')),
+             y = PVE))+
+  geom_bar(stat = 'identity')+
+  labs(x = NULL,
+       y = 'Proportion of Variation Explained',
+       title = 'Eight Pioneer Hybrids Grown in 5 Environments')+
+  coord_flip()+
+  theme_classic()
+
+levels = PA_Samples_Cooked %>%
+  mutate(GE = paste0(Genotype, Location)) %>%
+  group_by(Genotype) %>%
+  summarise(mean_MC = mean(Moisture.Avg)) %>%
+  arrange(mean_MC) %>%
+  select(Genotype) %>%
+  pull()
+
+PA_Samples_Cooked %>%
+  mutate(GE = paste0(Genotype, Location)) %>%
+  ggplot(aes(x = factor(Genotype, levels = levels), y = Moisture.Avg))+
+  geom_point(color = 'gray40')+
+  geom_smooth(method = 'lm', se = F)+
+  stat_summary()+
+  labs(x = NULL,
+       y = 'Cook Test Moisture Content')+
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+### PepsiCo Samples 2020
+
+pep_data = hybrid_data_with_genos %>%
+  filter(str_detect(Sample_ID, '[NE, IL]')) %>%
+  mutate(Location = case_when(str_detect(Sample_ID, 'IL') ~ 'IL',
+                              str_detect(Sample_ID, 'NE') ~ 'NE')) %>%
+  select(1:5) %>%
+  mutate(Genotype = str_remove_all(Genotype, '[NE_, IL_]')) %>% 
+  filter(!str_detect(Sample_ID, '[0-9]'))
+
+model = lmer(Moisture.Avg ~ (1 | Genotype) + (1 | State), data = pep_data)
+
+summary(model)$varcor %>%
+  as_tibble() %>%
+  mutate(Total_SS = sum(vcov),
+         PVE = vcov / Total_SS) %>%
+  ggplot(aes(x = factor(grp, levels = c('Residual',
+                                        'State',
+                                        'Genotype')),
+             y = PVE))+
+  geom_bar(stat = 'identity')+
+  labs(x = NULL,
+       y = 'Proportion of Variation Explained',
+       title = '2020 PepsiCo Samples Grown in IL and NE')+
+  coord_flip()+
+  theme_classic()
+
+levels = pep_data %>%
+  mutate(GE = paste0(Genotype, State)) %>%
+  group_by(Genotype) %>%
+  summarise(mean_MC = mean(Moisture.Avg)) %>%
+  arrange(mean_MC) %>%
+  select(Genotype) %>%
+  pull()
+
+pep_data %>%
+  mutate(GE = paste0(Genotype, State)) %>%
+  ggplot(aes(x = factor(Genotype, levels = levels), y = Moisture.Avg))+
+  geom_point(color = 'gray40')+
+  geom_smooth(method = 'lm', se = F)+
+  stat_summary()+
+  labs(x = NULL,
+       y = 'Cook Test Moisture Content')+
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+This data shows that G, E, and GxE are important to moisture content depending on the dataset that is used.  This justifies using multiple data splits when training the data to see which performs best.
+
+Many model, spectra, preprocessing, hyperparameter combinations were tested on MSI using the hybrid training data, and can now be analyzed.  The models were bootstrapped 100 times to understand the variation in prediciton power based on training composition.
+
+## Load and Look at Results
+```{r bootstrapping boosted and hybrid models}
+Path = '~/Desktop/Grad_School/Research/Hybrid_NMC/'
+boot_data = read_csv(paste0(Path, 'Data/ML_Model_Performances_Full_273.csv')) # remove _Full for original analysis
+
+colnames(boot_data)
+
+summary(boot_data)
+
+cor(boot_data %>% select_if(is.numeric))
+```
+
+## Look for the best models
+```{r look at best models}
+boot_summaries = boot_data %>%
+  group_by(model, spectra, hyperparameter, partitioning) %>% # removed model_preprocessing
+  summarise(n = n(),
+            pearsonr_mean = mean(pearsonr_test),
+            pearsonr_cv = sd(pearsonr_test) / mean(pearsonr_test),
+            spearmanr_mean = mean(spearmanr_test),
+            spearmanr_cv = sd(spearmanr_test) / mean(spearmanr_test),
+            rmse_mean = mean(rmse_test),
+            rmse_cv = sd(rmse_test) / mean(rmse_test))
+
+boot_summaries %>%
+  arrange(rmse_mean)
+
+boot_summaries %>%
+  arrange(desc(pearsonr_mean))
+
+boot_summaries %>%
+  arrange(desc(spearmanr_mean))
+
+ranked_models = boot_data %>%
+  ungroup() %>%
+  mutate(pearsonr_rank = rank(-pearsonr_test),
+         spearmanr_rank = rank(-spearmanr_test),
+         rmse_rank = rank(rmse_test)) %>%
+  group_by(model, spectra, hyperparameter, partitioning) %>% # removed model_preprocessing
+  summarise(total_rank = sum(c(pearsonr_rank, spearmanr_rank, rmse_rank))) %>%
+  arrange(total_rank)
+
+top_models = ranked_models %>%
+  group_by(model, partitioning) %>%
+  filter(total_rank == min(total_rank)) %>%
+  select(c(model, spectra, hyperparameter, partitioning)) # removed model_preprocessing
+
+top_models
+```
+
+The PLS model with baseline corrected spectra, scaled data, and an ncomp of 14 appears to perform the best on average.  Many of the PLS models with baseline spectra seem to be performing the best on average.  This instills a lot of confidence when continuing with this model.
+
+```{r determine best combination for each model}
+top_model_data = boot_data %>%
+  filter(paste0(model,
+                spectra,
+                hyperparameter,
+                #model_preprocessing,
+                partitioning) %in% paste0(top_models$model,
+                                          top_models$spectra,
+                                          top_models$hyperparameter,
+                                          #top_models$model_preprocessing,
+                                          top_models$partitioning))
+
+top_model_data %>%
+  ggplot(aes(x = model,
+             y = spearmanr_test,
+             color = model,
+             fill = model))+
+  geom_violin(alpha = 0.5,
+              show.legend = F)+
+  geom_jitter(show.legend = F)+
+  stat_summary(color = 'black',
+               show.legend = F)+
+  ylim(-1,1)+
+  facet_wrap(~partitioning, nrow = 1)+
+  theme_classic()
+```
+
+The best PLS model narrowly outperformed the best SVML model, which narrowly outperformed the best random forest model.  All of these models significantly outperformed the linear model which was to be expected.
+
+## Factors affecting performance
+```{r visualizing factors affecting performance}
+# How does hyperparameter affect performance?
+for(part in unique(boot_summaries$partitioning)){
+  print(boot_summaries %>%
+          pivot_longer(cols = c(pearsonr_mean, spearmanr_mean, rmse_mean),
+                       names_to = 'Metric',
+                       values_to = 'Performance') %>%
+          filter(partitioning == part) %>%
+          ggplot(aes(x = hyperparameter, y = Performance, color = spectra))+
+          geom_point()+
+          geom_smooth(color = 'black', alpha = 0.5, se = F)+
+          labs(title = part)+
+          facet_wrap(Metric~model, scales = 'free')+
+          theme_classic())
+}
+
+# Which model performed best across all/most data splits?
+top_model_data %>%
+  pivot_longer(cols = c(pearsonr_test, spearmanr_test, rmse_test),
+               names_to = 'Metric',
+               values_to = 'Performance') %>%
+  ggplot(aes(x = seed, y = Performance, color = model, fill = model))+
+  geom_smooth()+
+  facet_wrap(Metric~partitioning, scales = 'free')+
+  theme_classic()
+
+# Did the models perform better on training or testing data? Hopefully training 
+top_model_data %>%
+  filter(model != 'lm') %>%
+  mutate(row_num = row_number()) %>%
+  pivot_longer(cols = c(pearsonr_test,
+                        pearsonr_train,
+                        rmse_test,
+                        rmse_train,
+                        spearmanr_test,
+                        spearmanr_train),
+               names_to = 'metric_group',
+               values_to = 'Performance') %>%
+  separate(metric_group, c('Metric', 'Group'), '_') %>%
+  ggplot(aes(x = Group, y = Performance, group = row_num, color = model))+
+  geom_line(alpha = 0.1)+
+  geom_smooth(se = F, method = 'lm', aes(group = model))+
+  facet_wrap(Metric ~ partitioning, scales = 'free')+
+  scale_x_discrete(limits = rev)+
+  theme_classic()
+```
+
+As can be seen, the PLS model improves at low levels of hyperparameter values for all spectra types, whereas the random forest and SVML models are highly dependent on the type of spectra provided.  We can also see that the PLS and SVML models performed similarly across all seeds (different training/testing splits), and even had a cross over event in early seeds.  RF, while outperforming the linear model did not fare as well as PLS and SVML.
+
+It also appears that the models are performing better on the testing data than on the training cross validations.  This is strange, but not unheard of.  It could mean that the training data is generally more diverse and thus more difficult to predict.  It is also noticeable that the E split data has a slightly more intense regression than the G split data, which is slightly more than the R split data (for the correlation data at least).  I am not entirely sure what would cause this.  Perhaps is has to do with training vs testing size (E is probably the most difficult to split properly for) or it could have to do with data leakage, though I would not expect an increase in performance from partitions that are intended to decrease leakage.
+
+## Determining varition explained by training parameters
+```{r quantifying variance explained}
+# What is the variation explained due to model training parameters?
+boot_summaries_long = boot_summaries %>%
+  filter(model != 'lm') %>%
+  select(-spearmanr_cv, -pearsonr_cv, rmse_cv) %>%
+  pivot_longer(cols = c(pearsonr_mean, spearmanr_mean, rmse_mean), names_to = 'Metric', values_to = 'Performance')
+
+pve = tibble()
+
+for(metric in unique(boot_summaries_long$Metric)){
+  print(metric)
+  model = lmer(Performance ~ (1 | model) + 
+                             (1 | spectra) +
+                             (1 | partitioning) +
+                             #(1 | model_preprocessing) +
+                             (1 | model:spectra) +
+                             (1 | model:partitioning) +
+                             (1 | model:hyperparameter) + # Hyperparameter is nested within model
+                             (1 | spectra:partitioning) +
+                             (1 | spectra:hyperparameter) +
+                             (1 | partitioning:hyperparameter),
+                             #(1 | model:model_preprocessing) +
+                             #(1 | spectra:model_preprocessing) +
+                             #(1 | partitioning:model_preprocessing)
+               data = boot_summaries_long[boot_summaries_long$Metric==metric,])
+  
+  print(hist(residuals(model)))
+  
+  pve = pve %>%
+    bind_rows(summary(model)$varcor %>%
+                as_tibble() %>%
+                mutate(Total_SS = sum(vcov),
+                       PVE = vcov / Total_SS,
+                       Metric = metric))
+}
+
+pve %>%
+  ggplot(aes(x = factor(grp, levels = c('model',
+                                        'spectra',
+                                        'partitioning',
+                                        #'model_preprocessing',
+                                        'model:spectra',
+                                        'model:partitioning',
+                                        'model:hyperparameter',
+                                        'spectra:partitioning',
+                                        'spectra:hyperparameter',
+                                        'partitioning:hyperparameter',
+                                        #'model:model_preprocessing',
+                                        #'spectra:model_preprocessing',
+                                        #'partitioning:model_preprocessing',
+                                        'Residual')),
+                        y = PVE))+
+  geom_bar(stat = 'identity')+
+  labs(x = NULL,
+       y = 'Proportion of Variation Explained')+
+  coord_flip()+
+  scale_x_discrete(limits = rev)+
+  facet_wrap(~Metric)+
+  theme_classic()
+```
+
+It appears that model and spectra explain very little to no variation when the linear model is excluded, which makes some sense since the linear model is consistently an outlier.  The partitioning method explains the most variation which makes sense given that random clearly performed better than genotype which clearly outperformed environment. The model/hyperparameter, model/spectra, and spectra/hyperparameter explain most of the rest of the variation, which make sense given that any model can be bad given the wrong spectra or hyperparmeters, and sometime hyperparameters will perform better on certain spectra. 
+
+# Prediction of Best Hybrid Model
+## Select Best Model Information
+```{r top model information}
+top_model = ranked_models %>%
+  ungroup() %>%
+  filter(partitioning == 'Genotype') %>% # Random partitioning risks too much data leakage, and genotype partitioning performed the next best across all top models
+  filter(total_rank == min(total_rank)) %>%
+  select(model, spectra, hyperparameter, partitioning) # removed model_preprocessing
+```
+
+## Train Hybrid Based Model
+```{r tain hybrid model}
+hybrid_snv_data = hybrid_data %>%
+  dplyr::select(1:6) %>%
+  bind_cols(as_tibble(detrend(hybrid_data[,7:147],
+                              wav = as.numeric(colnames(hybrid_data[,7:147])),
+                              p = 2))) %>%
+  dplyr::select(-nearZeroVar(.))
+
+hybrid_model = train(Moisture.Avg ~ ., 
+                        data = hybrid_snv_data %>%
+                          dplyr::select(-c(Sample_ID, Location, Source, Experiment, Genotype)), 
+                        method = "pls", 
+                        metric = "Rsquared",
+                        #preProcess = c('scale'),
+                        tuneGrid = expand.grid(ncomp = 11),
+                        trControl = trainControl(method = "cv",
+                                                 index = groupKFold(hybrid_snv_data$Genotype, k = 10), 
+                                                 savePredictions = T,
+                                                 allowParallel = T
+                                                 )
+                        )
+```
+
+## Predict on hybrid scan data
+```{r read in hybrid scan data}
+hybrid_scans_uncooked = hybrid_scans %>%
+  filter(!Sample_ID %in% hybrid_data$Sample_ID) # 1944 - 273 = 1671
+```
+
+
+```{r process data and predict}
+hybrid_uncooked_snv_data = hybrid_scans_uncooked %>%
+  dplyr::select(1) %>%
+  bind_cols(as_tibble(detrend(X = hybrid_scans_uncooked[,6:146],
+                                  wav = as.numeric(colnames(hybrid_scans_uncooked[,6:146])),
+                                  p = 2)))
+
+hybrid_scans_uncooked['Moisture_Content_Pred'] = predict(hybrid_model, hybrid_uncooked_snv_data)
+
+hybrid_scans_uncooked %>%
+  select(Sample_ID, Moisture_Content_Pred) %>%
+  write_csv('~/Desktop/hybrids_predicted_moisture.csv')
+
+hybrid_scans_uncooked %>%
+  ggplot(aes(x = Moisture_Content_Pred))+
+  geom_histogram()+
+  geom_vline(xintercept = min(hybrid_data$Moisture.Avg))+
+  geom_vline(xintercept = max(hybrid_data$Moisture.Avg))+
+  theme_classic()
+```
+
+Let's find 10 high and 10 low samples to add to the training set to increase robustness.
+```{r find top and bottom 10 predictions}
+# This will need to be done after all of the hybrids have been scanned
+# print_option = F
+# if(print_option == T){
+#   set.seed(1234)
+#   high_and_low_samples_20 = hybrid_scans_uncooked %>%
+#     arrange(Moisture_Content_Pred) %>%
+#     mutate(rank = row_number()) %>%
+#     filter(rank <= 20 | rank >= (max(rank) - 19)) 
+#   
+#   high_and_low_samples_20 %>%
+#     write_csv('~/Desktop/Samples_to_find_high_and_low.csv')
+# }
+# 
+# high_and_low_samples = read_csv('/Users/michael/Downloads/Samples_found_high_and_low.csv') %>%
+#   filter(found == 'x')
+# 
+# cook_labels = high_and_low_samples %>%
+#   select(Sample_ID) %>%
+#   sample_frac(1) %>%
+#   mutate(A = NA,
+#          B = NA) %>%
+#   pivot_longer(cols = c(A, B),
+#                names_to = 'Hotplate_ID') %>%
+#   select(-value) %>%
+#   sample_frac(1) %>%
+#   group_by(Hotplate_ID) %>%
+#   mutate(Hotplate_Pos = rep(c(1:4), 5)) %>%
+#   group_by(Hotplate_ID, Hotplate_Pos) %>%
+#   mutate(Cook_Day = row_number()) %>%
+#   arrange(Cook_Day, Hotplate_ID, Hotplate_Pos)
+#   
+# cook_labels %>%
+#   write_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/Labels/High_and_Low_Predicted_Samples.csv')
+# 
+# cook_labels %>%
+#   mutate(Moisture_Y = NA,
+#          Moisture_Z = NA,
+#          DML_1 = NA, 
+#          DML_2 = NA) %>%
+#   pivot_longer(cols = c(Moisture_Y, Moisture_Z, DML_1, DML_2),
+#                names_to = 'Subsample') %>%
+#   select(-value) %>%
+#   write_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/Labels/High_and_Low_Predicted_Subsamples.csv')
+```
+
+```{r additional sample selection}
+# # Remove ERA, CH, future cook test samples, and samples without enough kernels from unscanned dataset
+# high_low_data = read_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/Labels/High_and_Low_Predicted_Samples.csv') %>%
+#   select(Sample_ID) %>%
+#   unique()
+# 
+# not_enough_sample = read_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/Inventory/Hybrids_without_enough_sample.csv')
+# 
+# potential_hybrids_for_cooks = hybrid_scans_uncooked %>%
+#   filter(!Sample_ID %in% high_low_data$Sample_ID,
+#          !Sample_ID %in% not_enough_sample$Sample_ID,
+#          !str_detect(Sample_ID, 'ERA'),
+#          !str_detect(Sample_ID, '^CH')) %>%
+#   select(-c(as.character(seq(950,1650,5)))) %>%
+#   arrange(Sample_ID)
+#
+# even_preds = seq(min(potential_hybrids_for_cooks$Moisture_Content_Pred), # Creating a list of 50 evenly spaced predictions
+#     max(potential_hybrids_for_cooks$Moisture_Content_Pred),
+#     length.out = 52)
+
+# Remove additional samples that didn't have enough sample from consideration
+# new_potential_hybrids_for_cooks = potential_hybrids_for_cooks %>%
+#     filter(Sample_ID != 'YCH22:2380',
+#            Sample_ID != 'YCH22:2291')
+#
+# hybrid_add_samples = tibble()
+#
+# for(pred in even_preds){
+#   hybrid_add_samples = hybrid_add_samples %>%
+#     bind_rows(new_potential_hybrids_for_cooks[abs(new_potential_hybrids_for_cooks$Moisture_Content_Pred-pred) == min(abs(new_potential_hybrids_for_cooks$Moisture_Content_Pred-pred)),] %>% mutate(closest_pred = pred,                                                                                 distance = Moisture_Content_Pred - pred))
+# }
+#
+# hybrid_add_samples = hybrid_add_samples %>%
+#   distinct(Sample_ID, .keep_all = T)
+#
+# hybrid_scans_uncooked %>%
+#   ggplot(aes(x = Moisture_Content_Pred))+
+#   geom_density(fill = 'gray40')+
+#   geom_rug(data = hybrid_add_samples,
+#            mapping = aes(x = Moisture_Content_Pred),
+#            length = unit(0.04, 'npc'),
+#            color = 'maroon',
+#            size = 0.7)+
+#   theme_classic()
+# 
+# # Create list of samples to find for addition
+# set.seed(1234)
+# hybrid_additional_labels = hybrid_add_samples %>% 
+#   mutate(distance_from_center = abs(Moisture_Content_Pred - mean(Moisture_Content_Pred))) %>%
+#   arrange(distance_from_center) %>%
+#   select(Sample_ID) %>%
+#   sample_frac(1) %>%
+#   mutate(A = NA,
+#          B = NA) %>%
+#   pivot_longer(cols = c(A, B),
+#                names_to = 'Hotplate_ID') %>%
+#   select(-value) %>%
+#   sample_frac(1) %>%
+#   group_by(Hotplate_ID) %>%
+#   mutate(Hotplate_Pos = rep(c(1:4), 13)) %>%
+#   group_by(Hotplate_ID, Hotplate_Pos) %>%
+#   mutate(Cook_Day = row_number()) %>%
+#   arrange(Cook_Day, Hotplate_ID, Hotplate_Pos)
+# 
+# # hybrid_additional_labels %>%
+# #   write_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/Labels/Hybrid_Additional_Samples.csv')
+# 
+# hybrid_additional_labels %>%
+#   mutate(Moisture_Y = NA,
+#          Moisture_Z = NA,
+#          DML_1 = NA,
+#          DML_2 = NA) %>%
+#   pivot_longer(cols = c(Moisture_Y, Moisture_Z, DML_1, DML_2),
+#                names_to = 'Subsample') %>%
+#   select(-value) %>%
+#   write_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/Labels/Hybrid_Additional_Subsamples.csv')
+```
+
+```{r verify additional samples are spread throughout the prediction space}
+# additional_cook_samples = read_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/Labels/Hybrid_Additional_Samples.csv') %>%
+#   filter(Hotplate_ID == 'A') %>%
+#   select(Sample_ID) %>%
+#   left_join(hybrid_scans_uncooked) %>%
+#   select(Sample_ID, Moisture_Content_Pred)
+# 
+# hybrid_scans_uncooked %>%
+#   filter(!Sample_ID %in% high_low_data$Sample_ID,
+#          !Sample_ID %in% not_enough_sample$Sample_ID,
+#          !str_detect(Sample_ID, 'ERA'),
+#          !str_detect(Sample_ID, '^CH')) %>%
+#   ggplot(aes(x = Moisture_Content_Pred))+
+#   geom_density(fill = 'gray50')+
+#   geom_vline(xintercept = min(hybrid_data$Moisture.Avg))+
+#   geom_vline(xintercept = max(hybrid_data$Moisture.Avg))+
+#   geom_rug(data = additional_cook_samples, aes(x = Moisture_Content_Pred))+
+#   theme_classic()
+```
+
+Since additional samples were chosen before the extreme samples were added to the training set, things seem to have shrunken toward the mean.  I am going to find additional samples spread throughout the top and bottom portion of the distribution to ensure we have enough representation.  To do this, I am going to use a random sampling from the bottom and the top (16 samples).
+
+```{r selecting extra additional samples}
+# set.seed(149)
+# extra_add_data = hybrid_scans_uncooked %>%
+#   filter(Moisture_Content_Pred < min(additional_cook_samples$Moisture_Content_Pred) | 
+#            Moisture_Content_Pred > max(additional_cook_samples$Moisture_Content_Pred)) %>%
+#   filter(!Sample_ID %in% high_low_data$Sample_ID,
+#          !Sample_ID %in% not_enough_sample$Sample_ID,
+#          !str_detect(Sample_ID, 'ERA'),
+#          !str_detect(Sample_ID, '^CH')) %>%
+#   sample_n(16) %>%
+#   select(Sample_ID, Moisture_Content_Pred)
+# 
+# hybrid_scans_uncooked %>%
+#   filter(!Sample_ID %in% high_low_data$Sample_ID,
+#          !Sample_ID %in% not_enough_sample$Sample_ID,
+#          !str_detect(Sample_ID, 'ERA'),
+#          !str_detect(Sample_ID, '^CH')) %>%
+#   ggplot(aes(x = Moisture_Content_Pred))+
+#   geom_histogram()+
+#   geom_vline(xintercept = min(hybrid_data$Moisture.Avg))+
+#   geom_vline(xintercept = max(hybrid_data$Moisture.Avg))+
+#   geom_rug(data = additional_cook_samples, aes(x = Moisture_Content_Pred))+
+#   geom_rug(data = extra_add_data, aes(x = Moisture_Content_Pred), color = 'red')+
+#   theme_classic()
+
+# extra_hybrid_add_labels = extra_add_data %>%
+#   mutate(A = NA,
+#          B = NA) %>%
+#   pivot_longer(cols = c(A, B),
+#                names_to = 'Hotplate_ID') %>%
+#   select(-value) %>%
+#   sample_frac(1) %>%
+#   group_by(Hotplate_ID) %>%
+#   mutate(Hotplate_Pos = rep(c(1:4), (n() / 4))) %>%
+#   group_by(Hotplate_ID, Hotplate_Pos) %>%
+#   mutate(Cook_Day = row_number()) %>%
+#   arrange(Cook_Day, Hotplate_ID, Hotplate_Pos)
+# 
+#  extra_hybrid_add_labels %>%
+#    write_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/Labels/Extra_Hybrid_Additional_Samples.csv')
+# 
+# extra_hybrid_add_labels %>%
+#   mutate(Moisture_Y = NA,
+#          Moisture_Z = NA,
+#          DML_1 = NA,
+#          DML_2 = NA) %>%
+#   pivot_longer(cols = c(Moisture_Y, Moisture_Z, DML_1, DML_2),
+#                names_to = 'Subsample') %>%
+#   select(-value) %>%
+#   write_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/Labels/Extra_Hybrid_Additional_Subsamples.csv')
+```
+
+```{r learning curve of training data}
+# Function for this is found in Hybrid_Model_Training_POC.R
+hybrid_lc = learning_curve(outcome_col = 1,
+                           data = hybrid_baseline_filtered[6:147],
+                           test_partition = 0.2,
+                           partition_by = hybrid_baseline_filtered$Genotype,
+                           reps = 10,
+                           iterations = 4:30,
+                           model = "pls",
+                           metric = "Rsquared",
+                           tuneparams = expand.grid(ncomp = 11))
+
+hybrid_lc %>%
+  pivot_longer(cols = -c(train_size, rep, p),
+               names_to = 'Group_Metric',
+               values_to = 'Performance') %>%
+  separate(Group_Metric, into = c('Group', 'Metric'), sep = '_') %>%
+  filter(Metric != 'spearmanr') %>%
+  ggplot(aes(x = train_size, y = Performance, color = Group))+
+  geom_point(show.legend = F)+
+  geom_smooth(se = F, show.legend = F)+
+  theme_classic()
+```
+
+
+## Validation of the Hybrid Model
+```{r selecting validation samples throughout distribution}
+# potential_validation_hybrids = hybrid_scans_uncooked %>%
+#   filter(!Sample_ID %in% hybrid_data$Sample_ID) %>%
+#   filter(Moisture_Content_Pred < (quantile(Moisture_Content_Pred, 0.75) + (1.5*IQR(Moisture_Content_Pred))) &
+#          Moisture_Content_Pred > (quantile(Moisture_Content_Pred, 0.25) - (1.5*IQR(Moisture_Content_Pred))))
+# 
+# hybrid_even_samples = tibble()
+# 
+# for(group in unique(potential_validation_hybrids$Experiment)){
+#   downsampled_groups = potential_validation_hybrids %>%
+#     filter(Experiment == group)
+# 
+#   if(group == 'Commercial Hybrids' | group == 'Unknown' | group == 'Pilot Trials' | group == 'Era Hybrids'){
+#     next
+#   }
+#   print(group)
+#   if(group == 'Agronomic Trial'){
+#     even_values = c(quantile(downsampled_groups$Moisture_Content_Pred, 0.333),
+#                     quantile(downsampled_groups$Moisture_Content_Pred, 0.667))
+#   } else{even_values = seq(min(downsampled_groups$Moisture_Content_Pred),
+#                            max(downsampled_groups$Moisture_Content_Pred),
+#                            length.out = 15)}
+# 
+# 
+#   for(value in even_values){
+#     #print(value) # Debugging
+#     hybrid_even_samples = hybrid_even_samples %>%
+#       bind_rows(downsampled_groups[abs(downsampled_groups$Moisture_Content_Pred-value) == min(abs(downsampled_groups$Moisture_Content_Pred-value)),] %>%
+#                 mutate(closest_value = value,
+#                        distance = Moisture_Content_Pred - value))
+# 
+#     downsampled_groups = downsampled_groups %>% filter(!Sample_ID %in% hybrid_even_samples$Sample_ID)
+#   }
+# }
+# 
+# val_samples = hybrid_even_samples %>%
+#   left_join(hybrid_genos_xref) %>%
+#   distinct(Sample_ID, .keep_all = T) %>%
+#   select(Genotype) %>%
+#   unique() %>%
+#   pull()
+# 
+# potential_genotypes_for_validation = hybrid_data %>%
+#   bind_rows(potential_hybrids_for_cooks %>%
+#               left_join(hybrid_genos_xref)) %>%
+#   filter(Genotype %in% val_samples) %>%
+#   arrange(Experiment) %>%
+#   mutate(Moisture = case_when(is.na(Moisture.Avg) ~ Moisture_Content_Pred,
+#                               is.na(Moisture_Content_Pred) ~ Moisture.Avg)) %>%
+#   select(Sample_ID, Genotype, Experiment, Moisture)
+# 
+# 
+# even_genos_val = tibble()
+# 
+# for(group in unique(potential_genotypes_for_validation$Experiment)){
+#   downsampled_groups = potential_genotypes_for_validation %>%
+#     filter(Experiment == group) %>%
+#     filter(!Sample_ID %in% c('P1602_Edgar_8', 'YCH22:2437', 'YCH22:1295'))
+# 
+#   if(group == 'Commercial Hybrids' | group == 'Unknown' | group == 'Pilot Trials' | group == 'Era Hybrids'){
+#     next
+#   }
+#   print(group)
+# 
+#   even_values = seq(min(downsampled_groups$Moisture),
+#                     max(downsampled_groups$Moisture),
+#                     length.out = 15)
+# 
+#   for(value in even_values){
+#     #print(value) # Debugging
+#     even_genos_val = even_genos_val %>%
+#     bind_rows(downsampled_groups[abs(downsampled_groups$Moisture-value) == min(abs(downsampled_groups$Moisture-value)),] %>%
+#                 mutate(closest_value = value,
+#                        distance = Moisture - value))
+# 
+#     downsampled_groups = downsampled_groups %>% filter(!Sample_ID %in% even_genos_val$Sample_ID)
+#   }
+# }
+# 
+# new_train_data = hybrid_data %>%
+#                                 filter(!Genotype %in% even_genos_val$Genotype)
+
+val_data_snv = hybrid_val_data %>%
+  select(1:6) %>%
+  bind_cols(as_tibble(detrend(X = hybrid_val_data[,7:147],
+                                  wav = as.numeric(colnames(hybrid_val_data[,7:147])),
+                                  p = 2)))
+val_data_snv['Moisture_Content_Pred'] = predict(hybrid_model, val_data_snv)
+
+hybrid_scans_uncooked %>%
+  left_join(hybrid_genos_xref) %>%
+  ggplot(aes(x = Moisture_Content_Pred))+
+  geom_density(fill = 'gray')+
+  geom_rug(data = val_data_snv, mapping = aes(x = Moisture_Content_Pred), color = 'red')+
+  geom_vline(xintercept = min(hybrid_snv_data %>%
+                                select(Moisture.Avg) %>%
+                                pull()))+
+  geom_vline(xintercept = max(hybrid_snv_data %>%
+                                select(Moisture.Avg) %>%
+                                pull()))+
+  theme_classic()
+
+
+facet_labels = c('Agronomic Trial' = 'Commercial Population 1',
+                 'Density' = 'Commercial Population 2',
+                 'Multi-Environment' = 'Commercial Population 3',
+                 'WiDiv - Hybrids' = 'WiDiv Panel Hybrids')
+
+val_samp_selection = hybrid_scans_uncooked %>%
+  left_join(hybrid_genos_xref) %>%
+  filter(Experiment != 'Unknown',
+         Experiment != 'Commercial Hybrids',
+         Experiment != 'Pilot Trials',
+         Experiment != 'Era Hybrids') %>%
+  ggplot(aes(x = Moisture_Content_Pred, fill = Experiment, color = Experiment))+
+  geom_density(show.legend = F)+
+  geom_rug(data = val_data_snv,
+           mapping = aes(x = Moisture_Content_Pred),
+           color = 'black')+
+  xlim(min(hybrid_snv_data %>%
+            select(Moisture.Avg) %>%
+            pull()),
+       max(hybrid_snv_data %>%
+            select(Moisture.Avg) %>%
+            pull()))+
+  scale_color_manual(values = c('#c2e699', '#31a354', '#006837', '#1f78b4'))+
+  scale_fill_manual(values = c('#c2e699', '#31a354', '#006837', '#1f78b4'))+
+  facet_wrap(~Experiment,
+             scales = 'free',
+             labeller = labeller(Experiment = facet_labels))+
+  labs(x = 'Predicted Nixtamalization Moisture Content')+
+  theme_classic()+
+  theme(text = element_text(size = 30))
+
+ggsave('~/Desktop/validation_sample_selection.png', val_samp_selection, device = 'png', width = 10, height = 7.5, units = 'in')
+
+# mutate(Experiment = case_when())
+  
+# even_genos_val %>%
+#   filter(!Sample_ID %in% hybrid_data$Sample_ID) %>%
+#   select(Sample_ID) %>%
+#   write_csv('~/Desktop/Grad_School/Research/Hybrid_NMC/Data/Validation_Samples_Final_To_Find.csv')
+
+# Make labels for cook test packaging
+# even_genos_val_labels = even_genos_val %>%
+#   filter(!Sample_ID %in% hybrid_data$Sample_ID) %>%
+#   select(Sample_ID) %>%
+#   mutate(A = NA,
+#          B = NA) %>%
+#   pivot_longer(cols = c(A, B),
+#                names_to = 'Hotplate_ID') %>%
+#   select(-value) %>%
+#   sample_frac(1) %>%
+#   group_by(Hotplate_ID) %>%
+#   mutate(Hotplate_Pos = rep(c(1:4), (n() / 4))) %>%
+#   group_by(Hotplate_ID, Hotplate_Pos) %>%
+#   mutate(Cook_Day = row_number()) %>%
+#   arrange(Cook_Day, Hotplate_ID, Hotplate_Pos)
+# 
+#  even_genos_val_labels %>%
+#    write_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/Labels/Validation_Final_Samples.csv')
+# 
+# even_genos_val_labels %>%
+#   mutate(Moisture_Y = NA,
+#          Moisture_Z = NA,
+#          DML_1 = NA,
+#          DML_2 = NA) %>%
+#   pivot_longer(cols = c(Moisture_Y, Moisture_Z, DML_1, DML_2),
+#                names_to = 'Subsample') %>%
+#   select(-value) %>%
+#   write_csv('/Users/michael/Desktop/Grad_School/Research/Hybrid_NMC/Data/Labels/Validation_Final_Subsamples.csv')
+```
+
+```{r junk}
+junk_data = read_csv('~/Downloads/Untitled spreadsheet - Sheet1.csv') %>%
+  select(Sample_ID, Moisture.Avg) %>%
+  group_by(Sample_ID) %>%
+  summarise(Moisture.Avg = mean(Moisture.Avg),
+            n = n())
+
+#early_val_data = hybrid_val_data %>%
+  left_join(junk_data, by = 'Sample_ID') %>%
+  mutate(Moisture.Avg = coalesce(Moisture.Avg.x, Moisture.Avg.y)) %>%
+  select(-c(Moisture.Avg.x, Moisture.Avg.y)) %>%
+  filter(!is.na(Moisture.Avg)) %>%
+  select(1:5, 148,6:146)
+
+cor(predict(hybrid_model, early_val_data), early_val_data$Moisture.Avg)
+cor(predict(hybrid_model, early_val_data), early_val_data$Moisture.Avg, method = 'spearman')
+
+for(exp in unique(early_val_data$Experiment)){
+  exp_data = early_val_data %>%
+    filter(Experiment == exp)
+  
+  print(exp)
+  print(cor(exp_data$Moisture_Content_Pred, exp_data$Moisture.Avg))
+  print(cor(exp_data$Moisture_Content_Pred, exp_data$Moisture.Avg, method = 'spearman'))
+}
+
+val_corr = early_val_data %>%
+  mutate(Moisture_Pred = predict(hybrid_model, early_val_data)) %>%
+  ggplot(aes(x = Moisture_Pred, y = Moisture.Avg, color = Experiment))+
+  geom_abline(color = 'gray', linetype = 'dashed')+
+  geom_point(show.legend = F)+
+  geom_smooth(method = 'lm', se = F, show.legend = F)+
+  scale_color_manual(labels = c('Commercial Population 1',
+                                               'Commercial Population 2',
+                                               'Commercial Population 3',
+                                               'WiDiv Panel Hybrids'),
+                     values = c('#c2e699', '#31a354', '#006837', '#1f78b4'))+
+  ylim(0.39, 0.48)+
+  xlim(0.39, 0.48)+
+  labs(x = 'Predicted Moisture Content',
+       y = 'Actual Moisture Content',
+       color = NULL)+
+  theme_classic()+
+  theme(text = element_text(size = 30),
+        legend.position = 'bottom')
+
+ggsave('~/Desktop/validation_correlation.png', val_corr, device = 'png', width = 7.5, height = 7.5, units = 'in')
+```
+
+
+```{r verify that validation samples are spread throughout distribution}
+
+```
+
+```{r verify experimental group composition}
+
+```
+
+```{r validation sample cook test data}
+# Read in validation data
+val_cook_data = read_csv('~/Desktop/Grad_School/Research/Hybrid_NMC/Data/Cooks/Hybrid_Validation_Data.csv')
+
+# Check number of reps
+val_cook_data %>%
+  group_by(Sample_ID) %>%
+  filter(n() != 2)
+
+# Look at QC metrics (pH, DML, NMC, reps)
+val_cook_data %>%
+  dplyr::select(Sample_ID, Hotplate.ID, pH, DML.Percent, Moisture.Avg) %>%
+  pivot_longer(cols = c(pH, DML.Percent, Moisture.Avg),
+               names_to = 'Cook_Param',
+               values_to = 'Value') %>%
+  pivot_wider(id_cols = c(Sample_ID, Cook_Param),
+              names_from = Hotplate.ID,
+              values_from = Value) %>%
+  unnest(cols = c('A', 'B')) %>%
+  group_by(Sample_ID, Cook_Param) %>%
+  mutate(AB_Diff = A-B) %>%
+  group_by(Cook_Param) %>%
+  filter(AB_Diff < quantile(AB_Diff, 0.75) + 1.5 * IQR(AB_Diff) & 
+         AB_Diff > quantile(AB_Diff, 0.25) - 1.5 * IQR(AB_Diff)) %>% # Filtered out two samples
+  ggplot(aes(x = Cook_Param, y = AB_Diff))+
+  geom_boxplot()+
+  geom_jitter()+
+  facet_wrap(~Cook_Param, scales = 'free')+
+  theme_classic()
+
+# Clean samples for moisture rep outliers
+val_cook_clean = val_cook_data %>% # 138 / 2 = 69 samples
+  dplyr::select(Sample_ID, Hotplate.ID, Moisture.Avg) %>%
+  pivot_wider(id_cols = c(Sample_ID),
+              names_from = Hotplate.ID,
+              values_from = Moisture.Avg) %>%
+  mutate(AB_Diff = A-B) %>%
+  filter(AB_Diff < quantile(AB_Diff, 0.75) + 1.5 * IQR(AB_Diff) & AB_Diff > quantile(AB_Diff, 0.25) - 1.5 * IQR(AB_Diff)) # Filtered out 1 sample
+
+# Average sample reps
+val_cook_avg = val_cook_clean %>%
+  group_by(Sample_ID) %>%
+  mutate(Moisture_Content = mean(c(A,B))) %>%
+  ungroup() %>%
+  dplyr::select(Sample_ID, Moisture_Content)
+
+# Check out the distribution of values and look for outliers
+val_cook_avg %>%
+  mutate(Sample = 'Validation') %>%
+  ggplot(aes(x = Sample, y = Moisture_Content))+
+  geom_boxplot()+
+  #geom_jitter()+
+  theme_classic() # It looks like there aren't any significant outliers!
+```
+
+Now for the moment of truth...
+```{r correlating cook test with predictions}
+val_cook_pred = val_cook_avg %>%
+  left_join(hybrid_scans_uncooked %>%
+              dplyr::select(Sample_ID, Moisture_Content_Pred, Experiment)) # Everything has a match!  Though things aren't looking particularly hopeful based on eyeballing the data...
+
+val_cook_pred %>%
+  arrange(desc(abs(Moisture_Content - Moisture_Content_Pred)))
+
+val_cook_pred %>%
+  ggplot(aes(x = Moisture_Content_Pred, y = Moisture_Content, color = Experiment))+
+  geom_abline(linetype = 'dashed', color = 'gray')+
+  geom_vline(xintercept = min(hybrid_data_with_genos$Moisture.Avg))+
+  geom_vline(xintercept = max(hybrid_data_with_genos$Moisture.Avg))+
+  geom_point()+
+  geom_smooth(se = F, method = 'lm')+
+  geom_smooth(se = F, method = 'lm', color = 'black')+
+  theme_classic()
+
+cor(val_cook_pred$Moisture_Content_Pred, val_cook_pred$Moisture_Content, method = 'spearman')
+
+val_cook_pred %>%
+  select_if(is.numeric) %>%
+  cor()
+```
+
+The model is not predicting very well currently, particularly for YCH samples.  Lets look into the PCA of the different experimental groups.
+```{r PCA of hybrid data by experiment}
+hybrid_data %>%
+  bind_rows(hybrid_scans_uncooked) %>%
+  select(Sample_ID, Experiment) %>%
+  bind_cols(as_tibble(prcomp(hybrid_data %>%
+                               bind_rows(hybrid_scans_uncooked) %>%
+                               select(as.character(seq(950,1650,5))), center = T, scale. = T)$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, color = Experiment))+
+  stat_ellipse()+
+  geom_point(alpha = 0.2)+
+  theme_classic()
+```
+Things don't look that far apart in terms of spectral diversity.  What if we overlay the training set?
+
+```{r}
+hybrid_data %>%
+  bind_rows(hybrid_scans_uncooked) %>%
+  select(Sample_ID, Experiment) %>%
+  bind_cols(as_tibble(prcomp(hybrid_data %>%
+                               bind_rows(hybrid_scans_uncooked) %>%
+                               select(as.character(seq(950,1650,5))), center = T, scale. = T)$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, group = Experiment))+
+  stat_ellipse(show.legend = F)+
+  geom_point(data = hybrid_data %>%
+                      bind_rows(hybrid_scans_uncooked) %>%
+                      select(Sample_ID, Experiment) %>%
+                      bind_cols(as_tibble(prcomp(hybrid_data %>%
+                                                   bind_rows(hybrid_scans_uncooked) %>%
+                                                   select(as.character(seq(950,1650,5))), center = T, scale. = T)$x)) %>%
+                      filter(row_number() <= 250),
+             mapping = aes(x = PC1, y = PC2), color = 'gray')+
+  geom_point(data = hybrid_data %>%
+                      bind_rows(hybrid_scans_uncooked) %>%
+                      select(Sample_ID, Experiment) %>%
+                      bind_cols(as_tibble(prcomp(hybrid_data %>%
+                                                   bind_rows(hybrid_scans_uncooked) %>%
+                                                   select(as.character(seq(950,1650,5))), center = T, scale. = T)$x)) %>%
+                      filter(Sample_ID %in% val_cook_pred$Sample_ID) %>%
+               mutate(error = val_cook_pred$Moisture_Content_Pred - val_cook_pred$Moisture_Content),
+             mapping = aes(x = PC1, y = PC2, color = error), show.legend = F)+
+  theme_classic()
+```
+
+I am not seeing much of a pattern in the error of the validation set compared to it's PC coordinates. It also appears that all of the validation samples are less extreme than the training set.
+
+Let's look at the composition of the training set by experiment compared to the composition of the validation set and overall data pool.
+```{r}
+hybrid_data %>%
+  select(Experiment) %>%
+  mutate(Group = 'Train') %>%
+  bind_rows(val_cook_pred %>%
+              select(Experiment) %>%
+              mutate(Group = 'Validation')) %>%
+  group_by(Experiment, Group) %>%
+  summarise(N = n()) %>%
+  group_by(Group) %>%
+  mutate(Prop = N / sum(N)) %>%
+  ggplot(aes(x = Experiment, y = Prop, fill = Group))+
+  geom_bar(stat = 'identity', position = 'dodge')+
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+hybrid_data %>%
+  select(Experiment) %>%
+  mutate(Group = 'Train') %>%
+  bind_rows(hybrid_scans_uncooked %>%
+              filter(!Sample_ID %in% val_cook_pred$Sample_ID) %>%
+              select(Experiment) %>%
+              mutate(Group = 'Uncooked')) %>%
+  group_by(Experiment, Group) %>%
+  summarise(N = n()) 
+```
+
+```{r permuted importance of wavebands}
+# norm_validation_data_inliers <- norm_validation_data %>%
+#   mutate(Predictions = val_predictions) %>%
+#   filter(Predictions > min(norm_training_data$Moisture_Uptake)) %>%
+#   select(-Predictions)
+# 
+# pred <- predict(r_svml_spectra, norm_validation_data_inliers)
+# baseline <- cor(norm_validation_data_inliers$Moisture_Uptake, pred)^2
+# 
+# cor_table <- NULL
+# cor_table_2 <- vector(length = 2)
+# library(gtools) # For the permute function
+# for(n in 1:100){
+#   for(i in 1:141){
+#     ### Permute Column ###
+#     perm <- permute(norm_validation_data_inliers[[i+3]])
+#     new_norm <- norm_validation_data_inliers
+#     new_norm[,i+3] <- perm
+#     
+#     ### Predictions ###
+#     new_pred <- predict(r_svml_spectra, new_norm)
+#     
+#     cor_table_2[2] <- cor(new_norm$Moisture_Uptake, new_pred)^2
+#     cor_table_2[1] <- colnames(new_norm[i+3])
+#     cor_table <- rbind(cor_table, cor_table_2)
+#   }
+# }
+# 
+# colnames(cor_table) <- c("Waveband_rm", "R_Squared")
+# 
+# spectra_imp <- cor_table %>%
+#   as_tibble() %>%
+#   mutate(Waveband_rm = as.numeric(Waveband_rm)) %>%
+#   group_by(Waveband_rm) %>%
+#   summarise(R_Squared = mean(as.numeric(R_Squared))) %>%
+#   mutate(loss = baseline - R_Squared,
+#         max_loss = max(loss),
+#         relative_loss = loss / max_loss) %>%
+#   ggplot(aes(x = Waveband_rm, y = loss, fill = loss))+
+#   geom_bar(stat = "identity", width = 5, show.legend = F)+
+#   scale_fill_gradient(low = "#efedf5", high = "#756bb1")+
+#   theme_classic()+
+#   labs(x = NULL,
+#        y = expression(paste("Loss of ", R^2)),
+#        tag = "A")+
+#   theme(text = element_text(size = 12))
+# 
+# spectra_imp
+# 
+# # For paper
+# ggsave(plot = spectra_imp, file = "../Manuscript_Images/Spectra_Importance.png", device = "png", width = 3.75, height = 1.5, units = "in", dpi = 600)
+# 
+# # For poster
+# newplot <- spectra_imp+
+#   theme(text = element_text(size = 10))+
+#   coord_cartesian()+
+#   scale_fill_manual(values = "#862633ff")+
+#   labs(tag = NULL)
+# 
+# #ggsave(plot = newplot, file = "Spectra_Importance.png", device = "png", width = 3, height = 1.75, units = "in", dpi = 600)
+```
+
+## Hybrid Model on Inbreds
+```{r hybrid model on inbreds}
+inbred_bsln_val = inbred_val_data %>%
+  filter(Sample_ID != 'YC16:1029') %>%
+  select(1,3) %>%
+  bind_cols(as_tibble(baseline(X = detrend(inbred_val_data[-1,9:149],
+                                           wav = as.numeric(colnames(inbred_val_data[-1,9:149])),
+                                           p = 2),
+                               wav = as.numeric(colnames(inbred_val_data[-1,9:149])))))
+
+cor(inbred_bsln_val$Moisture_Uptake, predict(hybrid_model, inbred_bsln_val))
+
+plot(predict(hybrid_model, inbred_bsln_val),
+     inbred_bsln_val$Moisture_Uptake, 
+     xlab = 'Predicted Moisture Content',
+     ylab = 'Actual Moisture Content',
+     xlim = c(0.35, 0.55),
+     ylim = c(0.35, 0.55))
+```
+The hybrid model does even worse predicting on inbreds than the inbred model performs on hybrids!
+
+## Environmental Analysis
+```{r estimate environmental PVE}
+hybrid_ge_data =hybrid_scans_uncooked %>%
+  mutate(Moisture_Content = predict(hybrid_model, hybrid_uncooked_snv_data),
+         Location = str_remove_all(Location, ',.*$')) %>%
+  filter(Location %in% locations$Location) %>%
+  filter(Experiment %in% c('Agronomic Trial', 'Multi-Environment', 'Density')) %>%
+  ungroup() %>%
+  left_join(hybrid_genos_xref)
+
+model = lmer(Moisture_Content ~ (1|Genotype) + (1|Location) + (1|Genotype:Location), data = hybrid_ge_data)
+
+pve_plot = summary(model)$varcor %>%
+  as_tibble() %>%
+  mutate(Total_SS = sum(vcov),
+  PVE = vcov / Total_SS) %>%
+  ggplot(aes(x = factor(grp, levels = c('Residual', 'Genotype:Location', 'Location', 'Genotype')), y = PVE))+
+  geom_bar(stat = 'identity', color = 'gray50', fill = 'gray50')+
+  coord_flip(expand = c(0,0))+
+  labs(x = NULL,
+       y = 'Proportion of Variance Explained')+
+  theme_classic()+
+  theme(text = element_text(size = 30))
+
+ggsave('~/Desktop/pve_plot.png', pve_plot, device = 'png', width = 9, height = 7.5, units = 'in')
+```
+
+
+Variable:     Definition:
+T2M           Temperature at 2 Meters
+T2M_MAX       Maximum Temperature at 2 Meters
+T2M_MIN       Minimum Temperature at 2 Meters
+PRECTOT       Precipitation Corrected (mm/day)
+WS2M          Wind Speed at 2 Meters
+RH2M          Relative Humidity at 2 Meters
+T2MDEW        Dew/Frost Point at 2 Meters
+n             Actual duration of sunshine (hour)
+N             Daylight hours (hour)
+RTA           Extraterrestrial radiation (MJ/m^2/day)
+SRAD          Solar radiation (MJ/m^2/day)
+SPV           Slope of saturation vapour pressure curve (kPa.Celsius)
+VPD           Vapour pressure deficit (kPa)
+ETP           Potential Evapotranspiration (mm.day)
+PETP          Deficit by Precipitation (mm.day)
+GDD           Growing Degree Day (oC/day)
+FRUE          Effect of temperature on radiation use efficiency (from 0 to 1)
+T2M_RANGE     Daily Temperature Range (oC day)
+
+```{r weather data}
+locations = read_csv('~/Desktop/Grad_School/Research/Hybrid_NMC/Data/XRefs/Hybrid_Growing_Locations.csv') %>%
+  mutate(Start_Date = as.Date(Start_Date, format = "%m/%d/%Y"),
+         End_Date = as.Date(End_Date, format = "%m/%d/%Y"))
+
+weather = get_weather(env.id = locations$Location,
+                      lat = locations$Latitude,
+                      lon = locations$Longitude,
+                      start.day = locations$Start_Date,
+                      end.day = locations$End_Date,
+                      country = locations$Country)
+
+# Back up weather file
+#weather = read_csv('~/Desktop/Grad_School/Research/Hybrid_NMC/Data/Weather_Data.csv')
+
+weather_vars = c("T2M",
+                 "T2M_MAX",
+                 "T2M_MIN",
+                 "PRECTOT",
+                 "WS2M",
+                 "RH2M",
+                 "T2MDEW",
+                 "n",
+                 "N",
+                 "RTA",
+                 "SPV",
+                 "VPD",
+                 "ETP",
+                 "PETP",
+                 "GDD",
+                 "FRUE",
+                 "T2M_RANGE")
+
+proc_weather = processWTH(weather %>%
+                            select(-ALT)) %>%
+  select(env, LON, LAT, YEAR, MM, DD, DOY, YYYYMMDD, daysFromStart, weather_vars)
+
+summary_weather = summaryWTH(proc_weather, var.id = weather_vars)
+
+summary_weather %>%
+  select(-sum) %>%
+  pivot_longer(cols = -c(env, variable), names_to = 'stat', values_to = 'value') %>%
+  ggplot(aes(x = env, y = value, color = stat, group = stat))+
+  geom_line()+
+  facet_wrap(~variable, scales = 'free')+
+  theme_classic()+
+  theme(axis.text.x = element_blank())
+```
+
+How similar are these environments?
+```{r environmental similarity}
+weather_wide = proc_weather %>%
+  select(env, weather_vars, daysFromStart) %>%
+  pivot_longer(-c(env, daysFromStart), names_to = 'Variable', values_to = 'Value') %>%
+  mutate(Var_Day = paste(Variable, daysFromStart, sep = '_')) %>%
+  select(env, Value, Var_Day) %>%
+  pivot_wider(id_cols = env, values_from = Value, names_from = Var_Day)
+
+summary(prcomp(weather_wide[,-1], center = T))
+
+weather_wide %>%
+  select(env) %>%
+  left_join(locations,
+            by = c('env' = 'Location')) %>%
+  mutate(Year = format(Start_Date, '%Y')) %>%
+  bind_cols(as_tibble(prcomp(weather_wide[,-1], center = T)$x)) %>%
+  ggplot(aes(x = PC1, y = PC2, label = env, color = Experiment))+
+  stat_ellipse()+
+  geom_point(alpha = 0.5)+
+  geom_text(nudge_y = c(5,5,5,5,5,-5,5,5,-5),
+            nudge_x = 2)+
+  labs(x = 'PC1 (55.36%)',
+       y = 'PC2 (25.00%)')+
+  theme_classic()
+```
+
+The environments seem to be most similar based on year and, to a lesser extent, location.  If locations was the primary determinant, I would expect to see Champaign and Champaign county clustered together, and I would also expect the 2015 locations to segregate with the IL locations from 2016.  I mention that location plays a role though becasue it seems like the locations from 2016 that don't fit really tightly into the cluster are from other states (if my memory of the geography is correct)
+
+```{r}
+weather_season = proc_weather %>%
+  group_by(env) %>%
+  mutate(CUMSUMPREC = cumsum(PRECTOT),
+         CUMSUMGDD = cumsum(GDD), .after = PRECTOT) %>%
+  ungroup() %>%
+  pivot_longer(cols = c(weather_vars, CUMSUMPREC, CUMSUMGDD),
+               names_to = 'Weather_Variable', values_to = 'Value') %>%
+  select(env, daysFromStart, Weather_Variable, Value) %>%
+  pivot_wider(id_cols = c(env, daysFromStart),
+              names_from = 'Weather_Variable',
+              values_from = 'Value') %>%
+  group_by(env) %>%
+  mutate(
+    across(c(weather_vars, CUMSUMPREC, CUMSUMGDD), ~slide(.x = .,
+                                               .f = mean,
+                                               .before = 15,
+                                               .after = 15,
+                                               .complete = T,
+                                               .step = 5))
+    ) %>%
+  ungroup() %>%
+  unnest(cols = c(weather_vars, CUMSUMPREC, CUMSUMGDD))
+
+weather_season %>%
+  pivot_longer(cols = -c(env, daysFromStart),
+               names_to = 'Weather_Variable',
+               values_to = 'Value') %>%
+  ggplot(aes(x = daysFromStart, y = Value, color = env))+
+  geom_line(show.legend = F)+
+  facet_wrap(~Weather_Variable, scales = 'free')+
+  theme_classic()
+```
+
+
+```{r correlating moisture content with environment}
+hybrid_scans_uncooked %>%
+  mutate(Moisture_Content = predict(hybrid_model, hybrid_uncooked_snv_data),
+         Location = str_remove_all(Location, ',.*$')) %>%
+  filter(Location %in% locations$Location) %>%
+  filter(Experiment != 'WiDiv - Hybrids') %>%
+  filter(!Sample_ID %in% corr_pop_samples$Sample_ID) %>%
+  ungroup() %>%
+  group_by(Experiment) %>%
+  mutate(Moisture_Content = (Moisture_Content_Pred - mean(Moisture_Content_Pred)) / sd(Moisture_Content_Pred)) %>%
+  ungroup() %>%
+  select(Experiment, Moisture_Content) %>%
+  ggplot(aes(x = Moisture_Content))+
+  geom_density()+
+  facet_wrap(~Experiment, scales = 'free_y')+
+  theme_classic()
+
+env_hybrid_preds = hybrid_scans_uncooked %>%
+  ungroup() %>%
+  mutate(Location = str_remove_all(Location, ',.*$')) %>%
+  filter(Location %in% locations$Location) %>%
+  filter(Experiment != 'WiDiv - Hybrids') %>%
+  filter(!Sample_ID %in% corr_pop_samples$Sample_ID) %>%
+  left_join(hybrid_genos_xref) %>%
+  group_by(Experiment) %>%
+  mutate(Moisture_Content = (Moisture_Content_Pred - mean(Moisture_Content_Pred)) / sd(Moisture_Content_Pred)) %>%
+  ungroup() %>%
+  select(Location, Moisture_Content) %>%
+  group_by(Location) %>%
+  #summarize(count = n()) # Debugging
+  mutate(Moisture_Content = median(Moisture_Content)) %>%
+  unique()
+
+cors = tibble(Climate_Var = NULL,
+              Day_From_Start = NULL,
+              R2 = NULL)
+
+for(c in colnames(weather_season)[-c(1:2)]){
+  print(c)
+  for(d in unique(weather_season$daysFromStart)){
+    data = suppressMessages(weather_season[weather_season$daysFromStart == d, c('env', c)] %>%
+                              full_join(env_hybrid_preds[c('Location', 'Moisture_Content')],
+                                        by = c('env' = 'Location')) %>%
+                              filter(env != 'Sidney',
+                                     env != 'Potomac') %>%
+                              select(-env))
+      
+      cors = cors %>%
+        bind_rows(tibble(Climate_Var = c,
+                         Day_From_Start = d,
+                         R = cor(data[,1], data[,2], use = 'complete.obs')))
+  }
+}
+
+max(abs(cors$R), na.rm = T)
+
+labels = tibble(T2M       =    '2m temp.',
+                T2M_MAX   =    '2m max temp.',
+                T2M_MIN   =    '2m min temp.',
+                T2M_RANGE =    'Daily temp. range',
+                PRECTOT   =    'Precip.',
+                CUMSUMPREC=    'Cumulative precip.',
+                RH2M      =    '2m relative hum.',
+                SPV       =    'Vap. press. curve',
+                VPD       =    'Vap. press. deficit',
+                ETP       =    'Potential evapotrans.',
+                PETP      =    'Deficit by precip.',
+                T2MDEW    =    '2m dew point',
+                WS2M      =    '2m wind speed',
+                n         =    'Sunshine duration',
+                N         =    'Daylight length',
+                RTA       =    'Extraterr. radiation',
+                GDD       =    'Growing degree day',
+                CUMSUMGDD =    'Cumulative GDD',
+                FRUE      =    'Temp. effect on RUE')
+
+levels = c('T2M', 'T2M_MAX', 'T2M_MIN',
+           'T2M_RANGE', 'GDD', 'CUMSUMGDD',
+           'FRUE', 'PRECTOT', 'CUMSUMPREC',
+           'PETP', 'n', 'N', 'VPD',
+           'RTA', 'RH2M', 'ETP', 
+           'T2MDEW', 'SPV', 'WS2M')
+
+cluster = hclust(cors %>%
+  pivot_wider(id_cols = Climate_Var, names_from = Day_From_Start, values_from = R) %>%
+  select(-Climate_Var) %>%
+  dist())
+
+cluster$order
+
+heatmap = cors %>%
+  filter(Climate_Var %in% levels) %>%
+  mutate(Climate_Var = factor(Climate_Var, unique(cors$Climate_Var)[cluster$order])) %>%
+  ggplot(aes(x = Climate_Var, y = Day_From_Start, color = R, fill = R))+
+  geom_tile()+
+  scale_y_continuous(limits = c(10,155), expand = c(0, 0)) +
+  scale_fill_gradientn(colors = c('blue', "white", "red"), limits = c(-0.5, 0.5))+
+  scale_color_gradientn(colors = c('blue', "white", "red"), limits = c(-0.5, 0.5))+
+  scale_x_discrete(labels = labels)+
+  coord_flip()+
+  labs(x = NULL,
+       y = 'Days After May 15',
+       fill = 'Correlation with Predicted Nixtamalization Moisture Content',
+       color = 'Correlation with Predicted Nixtamalization Moisture Content') +
+  theme_classic()+
+  theme(text = element_text(size = 30),
+        legend.position = 'bottom',
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent'), #transparent legend bg
+        line = element_blank(),
+        axis.text.y = element_text(size = 30),
+        axis.title.x = element_text(size = 30),
+        axis.text = element_text(color = 'black'))+
+  guides(color = guide_colorbar(title.position="bottom", label.position = 'top', title.hjust = 0.5, barwidth = 55),
+         fill = guide_colorbar(title.position="bottom", label.position = 'top', title.hjust = 0.5, barwidth = 55))
+
+ggsave('~/Desktop/weather_heatmap.png', heatmap, device = 'png', width = 18, height = 12, units = 'in', bg = 'transparent')
+
+facet_labels = c(CUMSUMPREC=    'Cumulative precip.',
+                 N         =    'Daylight length',
+                 RTA       =    'Extraterr. radiation',
+                 CUMSUMGDD =    'Cumulative GDD')
+
+facet_labeler <- labeller(.rows = function(variable) facet_labels[variable])
+
+labels_data = cors %>%
+  filter(Day_From_Start == max(Day_From_Start)) %>%
+  left_join(labels %>%
+              pivot_longer(cols = everything(),
+                           names_to = 'Climate_Var',
+                           values_to = 'Label'))
+
+cors %>%
+  ggplot(aes(x = Day_From_Start, y = R, group = Climate_Var))+
+  geom_line(size = 1)+
+  geom_hline(size = 1, yintercept = 0, linetype = 'dashed', color = 'gray')+
+  scale_x_continuous(limits = c(15,210), expand = c(0, 0))+
+  scale_y_continuous(limits = c(-0.5,0.5), expand = c(0, 0))+
+  labs(x = 'Days from Start (5/15/20XX)',
+       y = 'Pearson R')+
+  geom_text(data = labels_data,
+            mapping = aes(x = Day_From_Start,
+                          y = R,
+                          label = Label,
+                          hjust = 0),
+            nudge_y = c(0,0.01, -0.01))+
+  theme_classic()+
+  theme(text = element_text(size = 15))
+```
+
+It appears that cumulative growing degree days, cumulative precipitation, daylight length, and extraterrestrial radiation both have moderate correlations throughout the season and show a pattern throughout the season.  While GDD and FRUE look like potential candidates, it appears they are largely due to noise.  Lets look at how the correlation plots actually look.
+
+```{r trial - lmer throughout season}
+junk = hybrid_scans_uncooked %>%
+  mutate(Moisture_Content = predict(hybrid_model, hybrid_uncooked_snv_data),
+         Location = str_remove_all(Location, ',.*$')) %>%
+  filter(Location %in% locations$Location) %>%
+  filter(Experiment != 'WiDiv - Hybrids') %>%
+  ungroup() %>%
+  left_join(hybrid_genos_xref) %>%
+  select(Genotype, Location, Moisture_Content) %>%
+  left_join(weather_season, by = c('Location' = 'env'))
+
+info = tibble()
+
+for(day in unique(junk$daysFromStart)){
+  print(day)
+  dat = junk %>%
+    filter(daysFromStart == day)
+  
+  big_mod = lmer(Moisture_Content ~ (1|Genotype) + (daysFromStart|T2M) + (daysFromStart|T2M_MAX) +
+                   (daysFromStart|T2M_MIN) + (daysFromStart|PRECTOT) +
+                   (daysFromStart|RH2M) + (daysFromStart|T2MDEW) +
+                   (daysFromStart|VPD) + (daysFromStart|ETP) +
+                   (daysFromStart|GDD) + (daysFromStart|FRUE) +
+                   (daysFromStart|CUMSUMPREC) + (daysFromStart|CUMSUMGDD), data = junk, REML = F)
+  
+  info = info %>%
+    bind_rows(summary(big_mod)$varcor %>%
+                as_tibble() %>%
+                mutate(Total_SS = sum(vcov),
+                PVE = vcov / Total_SS) %>%
+                select(grp, PVE) %>%
+                mutate(daysFromStart = day))
+}
+
+info %>%
+  filter(grp != 'Genotype',
+         grp != 'Residual') %>%
+  ggplot(aes(x = daysFromStart, y = grp, fill = PVE))+
+    geom_tile()+
+    theme_classic()
+
+```
+
+
+```{r correlation plots with predicted moisture content}
+cors %>%
+  arrange(desc(abs(R))) %>%
+  filter(Climate_Var == 'CUMSUMGDD' | Climate_Var == 'RTA' | Climate_Var == 'N')
+
+weather_season_z %>%
+  full_join(env_hybrid_preds[c('Location', 'Moisture_Content')],
+                                        by = c('env' = 'Location')) %>%
+                              filter(env != 'Sydney',
+                                     env != 'Potomac') %>%
+  select(env, daysFromStart, CUMSUMGDD, N, RTA, Moisture_Content) %>%
+  filter(daysFromStart %in% c(11, 17, 86)) %>%
+  pivot_longer(cols = c(CUMSUMGDD, N, RTA)) %>%
+  filter((name == 'CUMSUMGDD' & daysFromStart == 11) |
+           (name == 'N' & daysFromStart == 86) | 
+           (name == 'RTA' & daysFromStart == 17)) %>%
+  #filter(Moisture_Content < 0.415)
+  #filter(name == 'CUMSUMGDD' & value > 0.64)
+  ggplot(aes(x = value, y = Moisture_Content, color = env))+
+  geom_point()+
+  stat_summary(show.legend = F)+
+  geom_smooth(se = F, color = 'black', method = 'lm')+
+  facet_wrap(~name, scales = 'free')+
+  theme_classic()
+```
+
+# Correlation between moisture content prediction and yield
+## Yield calculations
+```{r harvest data}
+harvest_data = read_csv(paste0(Path, 'Data/Harvest/2022_widiv_harvest.csv')) %>%
+  mutate(Sample_ID = toupper(Sample_ID)) %>%
+  mutate(Plants_Harvested = case_when(is.na(Plants_Harvested) ~ 10,
+                                       !is.na(Plants_Harvested) ~ Plants_Harvested),
+         Moisture = as.numeric(Moisture),
+         Total_Weight = as.numeric(Total_Weight),
+         Cob_Weight = as.numeric(Cob_Weight),
+         Test_Weight = as.numeric(Test_Weight)) %>%
+  filter(!is.na(Moisture),
+         !is.na(Total_Weight),
+         !is.na(Cob_Weight),
+         Cob_Weight < Total_Weight, # Removes 1 value
+         Plants_Harvested == 10) %>% # Removes 15 values
+  select(-notes, - Plants_Harvested)
+
+summary(harvest_data)
+
+harvest_data_long = harvest_data %>%
+  pivot_longer(cols = c(Total_Weight, Cob_Weight, Moisture, Test_Weight),
+               names_to = 'Measure',
+               values_to = 'Value')
+
+harvest_data_long %>%
+  ggplot(aes(x = Value))+
+  geom_histogram()+
+  facet_wrap(~Measure, scales = 'free')+
+  theme_classic()
+
+harvest_data_long %>%
+  ggplot(aes(x = Measure, y = Value))+
+  geom_boxplot()+
+  facet_wrap(~Measure, scales = 'free')+
+  theme_classic()
+```
+
+```{r yield calculations}
+stand_counts = read_csv(paste0(Path, 'Data/Harvest/YC22_YCH22_Stand_Counts.csv')) %>%
+  mutate(Sample_ID = toupper(Sample_ID))
+
+yield_data = harvest_data %>%
+  left_join(stand_counts) %>%
+  mutate(Dry_Matter_Proportion = 1 - (Moisture / 100), # Remove Moisture
+         Grain_Weight = (Total_Weight - Cob_Weight) * 0.00220462, # Determine grain mass and convert to pounds right away
+         Dry_Matter_Pounds = Grain_Weight * Dry_Matter_Proportion, # Determine dry grain material
+         Grain_Weight_at_15.5 = Dry_Matter_Pounds / 0.845, # Determine mass at specific moisture content
+         Bushels = Grain_Weight_at_15.5 / 56, # Calculate bushels per plot (pounds of grain / pounds per bushel)
+         Yield = (Bushels / 10) * (Stand_Count / ((15 * 2.5) / 43560))) # Adjust bushels for planting density per acre (about 31000 with 27 plants planted per 15 row 30 inch spaced plot)
+
+yield_data %>%
+  mutate(Group = case_when(str_detect(Sample_ID, 'H') ~ 'Hybrid',
+                           !str_detect(Sample_ID, 'H') ~ 'Inbred')) %>%
+  ggplot(aes(x = Yield, fill = Group))+
+  geom_density(alpha = 0.5)+
+  xlim(0,400)+
+  theme_classic()
+```
+
+```{r spatial visualzation}
+field_plan = read_csv(paste0(Path, 'Data/XRefs/YC22_YCH22_Field_Plan.csv')) %>%
+  pivot_longer(cols = -Range,
+               names_to = 'Row',
+               values_to = 'Sample_ID') %>%
+  mutate(Sample_ID = toupper(Sample_ID)) %>%
+  mutate(Range = as.numeric(Range),
+         Row = as.numeric(Row)) %>%
+  filter(Sample_ID != 'B73 x Mo17') # Remove stragglers that were filling space
+
+yc_genos = read_csv(paste0(Path, 'Data/XRefs/YC22_YCH22_Genotype_XRef.csv')) %>%
+  mutate(Sample_ID = toupper(Sample_ID))
+
+stand_counts %>%
+  mutate(Group = case_when(str_detect(Sample_ID, 'H') ~ 'Hybrid',
+                           !str_detect(Sample_ID, 'H') ~ 'Inbred')) %>%
+  ggplot(aes(x = Stand_Count, fill = Group))+
+  geom_density(alpha = 0.5)+
+  theme_classic()
+
+hybrid_yield_data = field_plan %>%
+  left_join(yield_data) %>%
+  left_join(yc_genos) %>%
+  left_join(stand_counts) %>%
+  mutate(Group = case_when(str_detect(Sample_ID, 'H') ~ 'Hybrid',
+                           !str_detect(Sample_ID, 'H') ~ 'Inbred')) %>%
+  group_by(Genotype) %>%
+  mutate(is_check = case_when(n() > 5 ~ 1,
+                              n() < 5 ~ 0)) %>%
+  ungroup() %>%
+  mutate(is_check = as.factor(is_check)) %>%
+  filter(Group == 'Hybrid',
+         Stand_Count > 20)
+
+hybrid_yield_data %>%
+  ggplot(aes(x = Row, y = Range, fill = Yield, color = Yield))+
+  geom_tile()+
+  scale_y_continuous(limits = c(26,52), expand = c(0, 0)) +
+  scale_x_continuous(limits = c(2,50), expand = c(0, 0)) +
+  theme_classic()
+
+hybrid_yield_data %>%
+  filter(is_check == 1) %>%
+  ggplot(aes(x = Row, y = Range, fill = Yield, color = Yield))+
+  geom_tile()+
+  scale_y_continuous(limits = c(26,52), expand = c(0, 0)) +
+  scale_x_continuous(limits = c(2,50), expand = c(0, 0)) +
+  theme_classic()
+```
+
+```{r determining check differences}
+rep_block_effects = hybrid_yield_data %>%
+  filter(is_check == 1) %>%
+  group_by(Genotype, Rep, Block) %>%
+  summarise(mean_yield = mean(Yield)) %>%
+  group_by(Genotype) %>%
+  mutate(geno_yield = mean(mean_yield),
+         yield_diff = mean_yield - geno_yield) %>%
+  group_by(Rep, Block) %>%
+  summarise(yield_correction = mean(yield_diff))
+
+rep_block_effects
+```
+
+It looks like there is definitely a rep and block effect for the checks, so we can subtract these yield differences from various plots to bring the averages back to zero differences between blocks and reps.
+
+```{r yield correction}
+corrected_hybrid_yields = hybrid_yield_data %>%
+  left_join(rep_block_effects) %>%
+  mutate(Corrected_Yield = Yield - yield_correction)
+
+corrected_hybrid_yields %>%
+  filter(is_check == 1) %>%
+  group_by(Genotype, Rep, Block) %>%
+  summarise(mean_yield = mean(Corrected_Yield)) %>%
+  group_by(Genotype) %>%
+  mutate(geno_yield = mean(mean_yield),
+         yield_diff = mean_yield - geno_yield) %>%
+  group_by(Rep, Block) %>%
+  summarise(yield_correction = mean(yield_diff))
+```
+
+The yields have been corrected, lets check to see what the map looks like now.
+```{r corrected yield spatial visualization}
+corrected_hybrid_yields %>%
+  ggplot(aes(x = Row, y = Range, fill = Corrected_Yield, color = Corrected_Yield))+
+  geom_tile()+
+  scale_y_continuous(limits = c(26,52), expand = c(0, 0)) +
+  scale_x_continuous(limits = c(2,50), expand = c(0, 0)) +
+  theme_classic()
+```
+
+There is still a spatial effect, but it is less severe.  This data should be ready to compare to moisture content when the scanning is complete.
+
+## Correlation of Yield and Moisture Content
+```{r relationship between yield and moisture content}
+mc_yield_data = corrected_hybrid_yields %>%
+  select(Sample_ID, Block, Rep, Corrected_Yield) %>%
+  left_join(hybrid_scans_uncooked %>% select(Sample_ID, Experiment, Moisture_Content_Pred)) %>%
+  filter(!is.na(Corrected_Yield))
+
+mc_yield_cor = mc_yield_data %$%
+  cor(Corrected_Yield, Moisture_Content_Pred, use = 'complete.obs')
+
+yield_mc_model = lm(mc_yield_data$Moisture_Content_Pred ~ mc_yield_data$Corrected_Yield)
+
+mc_yield_data %>%
+  mutate(lwr = predict(yield_mc_model, mc_yield_data, interval = 'predict')[,2],
+         upr = predict(yield_mc_model, mc_yield_data, interval = 'predict')[,3],
+         Block_Rep = paste0(Block, '_', Rep)) %>%
+  ggplot(aes(x = Corrected_Yield, y = Moisture_Content_Pred))+
+  geom_ribbon(mapping = aes(ymin = lwr, ymax = upr), fill = 'gray70')+
+  geom_smooth(aes(color = factor(Block)), method = 'lm', se = F)+
+  geom_point(aes(color = factor(Block)))+
+  geom_smooth(color = 'black', se = F, method = 'lm')+
+  annotate('text', label = paste0('Pearson R: ', round(mc_yield_cor, 3)), x = 200, y = 0.5)+
+  theme_classic()
+```
+I would assume this trend would be positive, though I am not surprised at how weak the correlation is.  In theory, increasing yield should increase starch and decrease protein. This decrease in protein should lead to higher moisture contents.  There is a chance for a Simpson's paradox to be happening here with the way fields are blocked (by flowering date, and thus don't have much overlap), but it would be helpful to look at the protein correlation with both yield and moisture content.
+
+## Protein Correlation with Yield and Moisture Content
+### Protein and Yield - Sanity Check
+```{r protein correlation with yield}
+yc_comp_data = mc_yield_data %>%
+  left_join(hybrid_comp, by = 'Sample_ID') %>%
+  filter(!is.na(Moisture_Content_Pred))
+
+yc_comp_data %>%
+  ggplot(aes(x = Protein, y = Corrected_Yield))+
+  geom_smooth(se = F, method = 'lm')+
+  geom_point()+
+  theme_classic()
+
+yc_comp_data %>%
+  ggplot(aes(x = Starch, y = Corrected_Yield, color = factor(Block)))+
+  geom_smooth(se = F, method = 'lm')+
+  geom_point()+
+  theme_classic()
+```
+The correlation between yield and protein is negative - as it should be!
+The correlation between yield and starch is basically zero - this is weird...
+
+### Correlation Between Protein and Benchtop Moisture Content in Cooked Samples
+```{r protein and nmc relationship cooked hybrids}
+hybrid_data %>%
+  mutate(Sample_ID = toupper(Sample_ID)) %>%
+  left_join(hybrid_comp) %>%
+  select(-c(7:147)) %>%
+  group_by(Experiment) %>%
+  filter(n() > 3) %>%
+  ungroup() %>%
+  ggplot(aes(x = Protein, y = Moisture.Avg, color = Experiment))+
+  geom_smooth(se = F, method = 'lm')+
+  geom_smooth(color = 'black', se = F, method = 'lm')+
+  geom_point()+
+  theme_classic()
+
+hybrid_data %>%
+  mutate(Sample_ID = toupper(Sample_ID)) %>%
+  left_join(hybrid_comp) %>%
+  select(-c(7:147)) %>%
+  group_by(Experiment) %>%
+  filter(n() > 3) %>%
+  ungroup() %>%
+  ggplot(aes(x = Starch, y = Moisture.Avg, color = Experiment))+
+  geom_smooth(se = F, method = 'lm')+
+  geom_smooth(color = 'black', se = F, method = 'lm')+
+  geom_point()+
+  theme_classic()
+```
+Nixtamalization moisture content and protein are negatively correlated if you look at each population separately - great!
+
+### Correlation Between Protein and Moisture Content in Uncooked Samples
+```{r uncooked correlation between protein and moisture content}
+# The reading in of data will need to be changed when a single file of scan data is created
+hybrid_scans_uncooked %>%
+  select(-c(as.character(seq(950,1650,5)))) %>%
+  mutate(Sample_ID = toupper(Sample_ID)) %>%
+  left_join(hybrid_comp) %>%
+  filter(Experiment == 'WiDiv - Hybrids') %>%
+  left_join(mc_yield_data) %>%
+  filter(!is.na(Block)) %>%
+  ggplot(aes(x = Protein, y = Moisture_Content_Pred))+
+  geom_smooth(color = 'black', se = F, method = 'lm')+
+  geom_point()+
+  labs(y = 'Predicted Nixtamalized Moisture Content')+
+  theme_classic()
+
+hybrid_scans_uncooked %>%
+  select(-c(as.character(seq(950,1650,5)))) %>%
+  mutate(Sample_ID = toupper(Sample_ID)) %>%
+  left_join(hybrid_comp) %>%
+  filter(Experiment == 'WiDiv - Hybrids') %>%
+  left_join(mc_yield_data) %>%
+  filter(!is.na(Block)) %>%
+  ggplot(aes(x = Starch, y = Moisture_Content_Pred))+
+  geom_smooth(color = 'black', se = F, method = 'lm')+
+  geom_point()+
+  labs(y = 'Predicted Nixtamalized Moisture Content')+
+  theme_classic()
+```
+Some groups have positive and some have negative correlations between protein and predicted nixtamalization moisture content, but some of these may be overcome by additions of more data (THEY WERE NOT... TRY BREAKING WIDIV INTO BLOCKS SINCE THIS IS BASED ON FLOWERING TIME WHICH CAN AFFECT GRAIN PROTEIN).
+
+# Heterosis/Additivity in moisture content
+## Widiv Inbreds and Hybrids Data
+Read in the data from the widiv inbred predictions and gather the predictions on widiv hybrids from earlier.
+```{r read in inbred and hybrid moisture content predictions}
+widiv_inbreds = read_csv(paste0(Path, 'Data/Scans/WiDiv_Inbreds_NIR_Spectra_predictions.csv')) %>%
+  filter(Prediction_Quality != "Low") %>%
+  select(-Prediction_Quality) %>%
+  rename(MC_Pred = Predicted_Moisture_Content)
+```
+
+## Connecting inbreds and hybrids
+Read in the XRef file that is going to link plot names to genotypes (and genotype crosses).
+```{r read in field book}
+widiv_plot_xref = read_csv(paste0(Path, 'Data/XRefs/2022_field_planning_widiv_xref.csv')) %>%
+  filter(Source != 'Andy') %>%
+  select(Plot, Genotype, Block, Rep) %>%
+  mutate(Plot = toupper(Plot),
+         Genotype = toupper(Genotype))
+```
+
+List out the traits that will be tested
+```{r traits of interest}
+TOI = c('Moisture_Content_Pred', 'Protein', 'Starch', 'Fiber', 'Fat', 'Ash')
+```
+
+
+Connect the moisture content predictions to their respective genotypes
+```{r filling in parental information}
+widiv_inbreds_geno = widiv_inbreds %>%
+  inner_join(widiv_plot_xref,
+             by = c('Sample_ID' = 'Plot')) %>%
+  group_by(Genotype) %>%
+  summarise(Moisture_Content_Pred = mean(MC_Pred)) %>%
+  left_join(hybrid_comp %>%
+              group_by(Genotype) %>%
+              summarise(Protein = mean(Protein),
+                        Starch = mean(Starch),
+                        Fiber = mean(Fiber),
+                        Fat = mean(Fat),
+                        Ash = mean(Ash),) %>%
+              mutate(Genotype = toupper(Genotype)))
+
+widiv_hybrids_geno = hybrid_scans_uncooked %>%
+  select(-c(6:146)) %>%
+  filter(str_detect(Sample_ID, '^YCH')) %>%
+  inner_join(widiv_plot_xref,
+             by = c('Sample_ID' = 'Plot')) %>%
+  separate(Genotype,
+           into = c('egg_parent', 'pollen_parent'),
+           sep = ' X ') %>%
+  filter(pollen_parent == 'B73' | pollen_parent == 'MO17') %>%
+  left_join(hybrid_comp[,c(1,4:8)])
+```
+
+Calculate the midparent value and the corrected midparent value (adjusting for parental effects on the triploid endosperm and open pollination).
+```{r calculating midparent value}
+#trait = 'Moisture_Content_Pred' # Debugging
+for(trait in TOI){
+  trait_data = widiv_hybrids_geno %>%
+    select(Sample_ID, egg_parent, pollen_parent, trait) %>%
+    left_join(widiv_inbreds_geno %>% select(Genotype, trait),
+              by = c('egg_parent' = 'Genotype')) %>%
+    rename(egg_parent_value = paste0(trait, '.y'),
+           hybrid_value = paste0(trait, '.x')) %>%
+    left_join(widiv_inbreds_geno %>% select(Genotype, trait),
+              by = c('pollen_parent' = 'Genotype')) %>%
+    rename(pollen_parent_value = trait) %>%
+    mutate(mid_parent = (egg_parent_value + pollen_parent_value) / 2) %>%
+    filter(!is.na(egg_parent_value),
+           !is.na(pollen_parent_value),
+           !is.na(hybrid_value))
+  
+  print(trait_data %>%
+    ggplot(aes(x = mid_parent, y = hybrid_value))+
+    geom_abline(linetype = 'dashed', color = 'gray60')+
+    geom_point()+
+    labs(title = trait)+
+    geom_smooth(method = 'lm', se = F, formula = 'y~x')+
+    theme_classic())
+}
+
+mid_parent_plot = trait_data %>%
+  ggplot(aes(x = mid_parent, y = hybrid_value))+
+  geom_abline(linetype = 'dashed', color = 'black')+
+  geom_point(color = 'gray50')+
+  labs(x = 'Midparent Predicted Moisture Content',
+       y = 'Hybrid Predicted Moisture Content')+
+  ylim(0.39,0.47)+
+  xlim(0.39,0.47)+
+  geom_smooth(method = 'lm', se = F, color = 'black')+
+  theme_classic()+
+  theme(text = element_text(size = 30))
+
+ggsave('~/Desktop/mid_parent_plot.png', mid_parent_plot, device = 'png', width = 9, height = 7.5, units = 'in', bg = 'transparent')
+# corrected_mid_parent = ((2/3)*((1/2)*egg_parent_MC_Pred+(1/2)*pollen_parent_MC_Pred)) + ((1/3)*((1/20)*((1/2)*egg_parent_MC_Pred+(1/2)*pollen_parent_MC_Pred) + (19/20)*mean_MC_Pred)))
+```
+
+There is a bit of a correlation here between the predicted moisture content and either the mid parent or corrected mid parent.  It is not shown here, but the pollen parent and egg parent is also not correlated with the predicted moisture content, and splitting the data by blocks does not reveal any striking information (one of the blocks is slightly positive and the other slightly negative, but the groups are highly overlapped and dispersed).
+
+The midparent value is supposed to be a genotypic value which is obtained by testing the lines in infinitely many locations and replicates.
+
+Lets try looking at additivity.  To do this I will need to plot the P1 value, Het value, and P2 value.  I can try this for a few to see what occurs.
+```{r additivity plots}
+for(trait in TOI){
+  additivity_data = widiv_hybrids_geno %>%
+    select(Sample_ID, egg_parent, pollen_parent, trait) %>%
+    left_join(widiv_inbreds_geno %>% select(Genotype, trait),
+              by = c('egg_parent' = 'Genotype')) %>%
+    rename(egg_parent_value = paste0(trait, '.y'),
+           hybrid_value = paste0(trait, '.x')) %>%
+    left_join(widiv_inbreds_geno %>% select(Genotype, trait),
+              by = c('pollen_parent' = 'Genotype')) %>%
+    rename(pollen_parent_value = trait) %>%
+    mutate(group = row_number()) %>%
+    filter(!is.na(egg_parent_value)) %>%
+    group_by(group) %>%
+    mutate(low_parent_value = min(egg_parent_value, pollen_parent_value),
+           high_parent_value = max(egg_parent_value, pollen_parent_value)) %>%
+    pivot_longer(cols = c(hybrid_value, low_parent_value, high_parent_value),
+                 names_to = 'Individual_Type',
+                 values_to = 'Trait_Value') %>%
+    mutate(Individual_Type = case_when(Individual_Type == 'hybrid_value' ~ 1,
+                                       Individual_Type == 'low_parent_value' ~ 0,
+                                       Individual_Type == 'high_parent_value' ~ 2)) %>%
+    filter(!is.na(egg_parent_value),
+           !is.na(pollen_parent_value),
+           !is.na(Trait_Value))
+
+  print(additivity_data %>%
+    ggplot(aes(x = Individual_Type, y = Trait_Value, group = group))+
+    geom_line(alpha = 0.1)+
+    geom_smooth(se = F, method = 'lm', aes(group = NULL), formula = 'y~x')+
+    labs(y = trait)+
+    theme_classic())
+  
+  add_model_data = tibble()
+
+  for(grp in unique(additivity_data$group)){
+    data = additivity_data[additivity_data$group == grp,]
+    model = lm(data$Trait_Value ~ data$Individual_Type)
+    coef = summary(model)[4][[1]][2]
+    int = summary(model)[4][[1]][1]
+    
+    add_model_data = add_model_data %>%
+      bind_rows(tibble(group = grp,
+                       coefs = coef,
+                       ints = int))
+  }
+  
+  add_dom_data = additivity_data %>%
+    select(group, Individual_Type, Trait_Value) %>%
+    left_join(add_model_data) %>%
+    mutate(estimated_value = ints + coefs * Individual_Type,
+           dominance_deviation = Trait_Value - estimated_value)
+  
+  print(add_dom_data %>%
+    filter(Individual_Type == 1) %>% # This is just to make sure we only account for one sample from each family.
+    ggplot(aes(x = coefs))+
+    geom_histogram(bins = 30)+
+    labs(title = trait)+
+    theme_classic())
+  
+  print(add_dom_data %>%
+    filter(Individual_Type == 1) %>%
+    ggplot(aes(x = dominance_deviation))+
+    geom_histogram(bins = 30)+
+    labs(title = trait)+
+    theme_classic())
+}
+
+
+reaction_norm_plot = additivity_data %>%
+  ggplot(aes(x = factor(Individual_Type), y = Trait_Value))+
+  geom_line(alpha = 0.1, aes(group = group))+
+  stat_summary(color = 'darkred', geom = 'line', aes(group = 1), size = 3)+
+  stat_summary(color = 'darkred', size = 2)+
+  scale_x_discrete(labels = c('0' = 'Low Parent',
+                              '1' = 'Hybrid',
+                              '2' = 'High Parent'),
+                   expand = c(0.01,0.15))+
+  labs(y = 'Nixtamalization Moisture Content',
+       x = NULL)+
+  theme_classic()+
+  theme(axis.title = element_text(size = 30, color = 'black'),
+        axis.text.x = element_text(size = 30, color = 'black'),
+        axis.text.y = element_text(size = 30, color = 'black'),
+        axis.line = element_line(linewidth = 2),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill='transparent'), #transparent panel bg
+        plot.background = element_rect(fill='transparent', color=NA), #transparent plot bg
+        panel.grid.major = element_blank(), #remove major gridlines
+        panel.grid.minor = element_blank(), #remove minor gridlines
+        legend.background = element_rect(fill='transparent'), #transparent legend bg
+        )
+
+ggsave('~/Desktop/reaction_norm.png', reaction_norm_plot, device = 'png', width = 18, height = 12, units = 'in', bg = 'transparent')
+```
+
+There is definitely a positive slope, though having two repeating parents makes the graph look a little funny.  I am not totally sure this is a fair representation or that there is necessarily an upward pattern given that we are forcing the low-to-high pattern.
+
+Let's try to calculate GCA and breeding values for this trait within the widiv hybrid population.
+```{r calculate gcas}
+for(trait in TOI){
+  trait_data = widiv_hybrids_geno %>%
+    select(Sample_ID, egg_parent, pollen_parent, trait) %>%
+    rename(Trait = trait) %>%
+    mutate(mean_trait = mean(Trait, na.rm = T)) %>%
+    group_by(egg_parent) %>%
+    summarise(half_sib_mean = mean(Trait, na.rm = T),
+              mean_trait = unique(mean_trait)) %>%
+    ungroup() %>%
+    mutate(GCA = mean_trait - half_sib_mean,
+           BV = 2*GCA) %>%
+    filter(!is.na(half_sib_mean),
+           !is.na(mean_trait),
+           !is.na(GCA),
+           !is.na(BV))
+  
+  print(trait_data %>%
+    ggplot(aes(x = BV))+
+    geom_histogram(bins = 50)+
+    labs(title = trait)+
+    theme_classic())
+}
+```
+
+These breeding values are very limited as I only used the samples that were crossed to be B73 and MO17, and they only had 2 values to average for a given egg parent. The values looks great (some lines have an effect of up to 5% moisture content prediction), but are likely inflated due to the limited number of samples.
+
+It might be better to use LMER with a parental function to extract BLUPs of the parental effects?  Pollen parent will probably be a fixed effect.
+```{r parental effect equation}
+PVE = tibble()
+
+for(trait in TOI){
+  data = widiv_hybrids_geno %>%
+    filter(!is.na(trait)) %>%
+    rename(outcome = trait)
+
+  parental_model = lmer(outcome ~ (1| egg_parent) + (pollen_parent) + (1| Block),
+                      data = data,
+                      REML = T)
+
+  PVE = PVE %>%
+  bind_rows(summary(parental_model)$varcor %>%
+              as_tibble() %>%
+              mutate(PVE = vcov / sum(vcov),
+                     Trait = trait))
+
+print(ranef(parental_model)$egg_parent %>%
+  as_tibble() %>%
+  rename(Egg_Parent_Effect = `(Intercept)`) %>%
+  ggplot(aes(x = Egg_Parent_Effect))+
+  geom_density()+
+  xlim(-0.01,0.01)+
+  labs(x = 'Egg Parent Effects',
+       title = trait)+
+  theme_classic())
+}
+
+PVE %>% 
+  ggplot(aes(x = grp, y = PVE))+
+  geom_bar(stat = 'identity')+
+  facet_wrap(~Trait)+
+  theme_classic()+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+It looks like there is a moderate egg parent effect (which explains about 16% of the variation), with the largest effects being +/- 1 percent moisture content. This is based on limited replications (which will fill in when all of the data is in), but shows promise.
+
