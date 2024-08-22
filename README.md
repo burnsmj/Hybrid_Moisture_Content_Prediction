@@ -18,7 +18,7 @@ For more information, please see the manuscript at: **ADD DOI HERE**
 ## Pipeline Description:
 
 
-# Directories:
+## Directories:
 - scripts:
   - scripts used in the analysis for the publication
 - data:
