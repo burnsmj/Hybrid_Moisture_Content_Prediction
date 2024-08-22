@@ -1,1 +1,20 @@
-The scripts in this folder are 
+The scripts in this folder were used to generate the results in the manuscript at some point along the process.
+
+The vast majority of analysis was performed with the Hybrid_NMC.Rmd file (check here with questions first).
+
+Additionally, scripts were uploaded to MSI to perform many iterations of various model trainings. The order 
+these should be run is as follows:
+1. ML_Model_Build_Array.R (Local - builds the array used for training)
+2. ML_Model_Run_Array_Loop (MSI - runs for loop used for training models)
+    a. The script above automatically submits a job for ML_Model_Run_Array.sh
+    b. The script above automatically submits a job for ML_Model_Run_Array.R
+3. Model_Performance_Concatenation.sh (MSI - concatenates results from previous step)
+
+We also found that scanning samples across different NIR machines led to small changes in spectral profiles,
+so I developed a script to correct the scans based on the scans of 20 samples on both machines in question.
+This script is NIR_Scan_Correction.R
+
+For the genomic prediction hapmap dataset, we needed to downsample the number of markers based on LD 
+(LD_Downsample.sh - run on MSI) as well as other parameters (Hapmap_Filtering.py).
+
+We also needed to combine spectral and compositional data for the manuscript (combining_spectral_and_comp_data.R)
